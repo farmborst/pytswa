@@ -5,15 +5,12 @@ from __future__ import print_function, division
 try:
     from Tkinter import (Tk, mainloop, StringVar, Label, Button, N, E, S, W, LabelFrame, _setit, BOTH)
     from ttk import Frame
-    from tkFileDialog import askopenfilename
     from tkMessageBox import showerror
 except:
     from tkinter import (Tk, mainloop, StringVar, Label, Button, N, E, S, W, LabelFrame, _setit, BOTH)
     from tkinter.ttk import Frame
-    from tkinter.filedialog import askopenfilename
     from tkinter.messagebox import showerror
 from epics import caget
-from h5py import File as h5pyFile
 from time import sleep, strftime
 from datetime import datetime
 from threading import Thread
@@ -24,66 +21,45 @@ from matplotlib.pyplot import figure, rcdefaults, rcParams, close
 from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
                                                NavigationToolbar2TkAgg)
 from scipy.interpolate import InterpolatedUnivariateSpline
+from numpy import (linspace, arange, concatenate, pi, complex128, zeros,
+                   empty, angle, unwrap, diff, abs as npabs, ones, vstack, exp,
+                   log, linalg, shape)
 from numpy.fft import fft, fftfreq, ifft
-
-def h5save(filename, verbose, **namesandvariables):
-    ''' save dataset to hdf5 format
-    input:
-        - desired filename as string
-        - names = values of variables to be saved
-    return:
-        - saves data to "timestamp_filename.hdf5 in working directory"
-        - complete filename is returned
-    usage:
-        1.  recommended
-                datadict = {'a' : 2,
-                            'b' : 'foo',
-                            'c' : 1.337,
-                            'd' : [1, 2, 'c']}
-                h5save(filename, True. **datadict)
-        2.  alternative
-                a=2, b='foo', c=1.337, d=[1, 2, 'c']
-                h5save(filename, True. a=a, b=b, c=c, d=d)
-                accepted datatypes:
-                    - int   -> numpy.int64
-                    - str   -> str
-                    - float -> numpy.float64
-                    - list  -> numpy.ndarray of:
-                                - np.string__   if >0 string
-                                - np.float64    if >0 float
-                                - np.int64      if only ints
-
-    '''
-    timstamp = strftime('%Y%m%d%H%M%S')
-    filename = ''.join([timstamp, '_', filename, '.hdf5'])
-    hdf5_fid = h5pyFile(filename, 'w')
-    if verbose:
-        print('\n==========================================================')
-        print('Beginning to save to %s ...' % filename)
-        print('\n----------------------------------------------------------')
-    for key, value in namesandvariables.iteritems():
-            if verbose:
-                print('Saving values in %s ... ' % key)
-            hdf5_fid.create_dataset(key, data=value)
-    if verbose:
-        print('\n----------------------------------------------------------')
-        print('... finished saving to %s !' % filename)
-        print('\n==========================================================')
-    hdf5_fid.close()
-    return filename
+import pyfftw
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
+from layout import (cs_label, cs_Dblentry, cs_Intentry, cs_Strentry)
+from hdf5 import h5save, h5load
 
 
-def evaltswa(counts, bunchcurrents, clip=[38460, 87440], effort='FFTW_MEASURE', dump=0, fitorder=1):
-
-    beg, end = clip
-    if dump > 0:
-        counts = counts[:-dump, beg:end]
-        bunchcurrents = bunchcurrents[:-dump]
+effort = ['FFTW_ESTIMATE', 'FFTW_MEASURE', 'FFTW_PATIENT', 'FFTW_EXHAUSTIVE']
+def init_pyfftw(x, effort=effort[0], wis=False):
+    N = len(x)
+    n = pyfftw.simd_alignment
+    a = pyfftw.n_byte_align_empty(int(N), n, 'complex128')
+    a[:] = x
+    if wis is not False:
+        pyfftw.import_wisdom(wis)
+        fft = pyfftw.builders.fft(a, threads=8)
+        ifft = pyfftw.builders.ifft(a, threads=8)
     else:
-        counts = counts[:, beg:end]
+        fft = pyfftw.builders.fft(a, planner_effort=effort, threads=8)
+        ifft = pyfftw.builders.ifft(a, planner_effort=effort, threads=8)
+    return fft, ifft
+
+
+def hanning(N):
+    return (cos(linspace(-pi, pi, N))+1)/2
+
+
+def evaltswa(counts, bunchcurrents):
+    roisig = [38460, 87440]
+    beg, end = roisig
+    counts = counts[0, beg:end]
 
     N = shape(counts)[1]      # number of points taken per measurement
-    n = len(bunchcurrents)    # number of measurements made
     fs = 1.2495*1e6           # sampling frequency in Hz
     dt = 1/fs
     t = arange(N)*dt*1e3  # time in ms
@@ -92,13 +68,13 @@ def evaltswa(counts, bunchcurrents, clip=[38460, 87440], effort='FFTW_MEASURE', 
 
     with open('calib_InterpolatedUnivariateSpline.pkl', 'rb') as fh:
         calib = pickle.load(fh)
-    bbfbpos = [calib(bbfbcntsnorm[i, :]) for i in range(n)]
-
-    init_pyfftw(bbfbpos[0], effort=effort)
-    wisdom = pyfftw.export_wisdom()
+    bbfbpos = calib(bbfbcntsnorm[0, :])
 
     # Turn on the cache for optimum pyfftw performance
     pyfftw.interfaces.cache.enable()
+
+    init_pyfftw(bbfbpos, effort='FFTW_MEASURE')
+    wisdom = pyfftw.export_wisdom()
 
     # create frequency vector
     fd = linspace(0, fs/2/1e3, N/2)
@@ -112,36 +88,34 @@ def evaltswa(counts, bunchcurrents, clip=[38460, 87440], effort='FFTW_MEASURE', 
     frequencyfilter = concatenate((zeros(pts_lft), hanning(pts_roi), zeros(pts_rgt+N/2)))
 
     # predefine lists
-    fftx = empty([n, N], dtype=complex128)
-    fftx_clipped = empty([n, N], dtype=complex128)
-    fftx_filtered = empty([n, N], dtype=complex128)
-    analytic_signal = empty([n, N], dtype=complex128)
-    amplitude_envelope = empty([n, N-1])
-    instantaneous_phase = empty([n, N])
-    instantaneous_frequency = empty([n, N-1])
+    fftx = empty(N, dtype=complex128)
+    fftx_filtered = empty(N, dtype=complex128)
+    analytic_signal = empty(N, dtype=complex128)
+    amplitude_envelope = empty(N-1)
+    instantaneous_phase = empty(N)
+    instantaneous_frequency = empty(N-1)
 
-    for i in range(n):
-        # initialise pyfftw for both signals
-        myfftw, myifftw = init_pyfftw(bbfbpos[i], wis=wisdom)
+    # initialise pyfftw for both signals
+    myfftw, myifftw = init_pyfftw(bbfbpos, wis=wisdom)
 
-        # calculate fft of signal
-        fftx[i, :] = myfftw(bbfbpos[i])
+    # calculate fft of signal
+    fftx[:] = myfftw(bbfbpos)
 
-        # clip negative frequencies
-        fftx_clipped[i, :] = fftx[i, :]
-        fftx_clipped[i, N/2+1:] = 0
+    # clip negative frequencies
+    fftx_clipped = fftx.copy()
+    fftx_clipped[N/2+1:] = 0
 
-        # restore lost energy of negative frequencies
-        fftx_clipped[i, 1:N/2] *= 2
+    # restore lost energy of negative frequencies
+    fftx_clipped[1:N/2] *= 2
 
-        # apply frequency filter
-        fftx_filtered[i, :] = fftx_clipped[i, :]*frequencyfilter
+    # apply frequency filter
+    fftx_filtered[:] = fftx_clipped*frequencyfilter
 
-        # calculate inverse fft (analytical signal) of filtered and positive frequency only fft
-        analytic_signal[i, :] = myifftw(fftx_filtered[i, :])
-        amplitude_envelope[i, :] = npabs(analytic_signal[i, :])[:-1]
-        instantaneous_phase[i, :] = unwrap(angle(analytic_signal[i, :]))
-        instantaneous_frequency[i, :] = diff(instantaneous_phase[i, :]) / (2*pi) * fs
+    # calculate inverse fft (analytical signal) of filtered and positive frequency only fft
+    analytic_signal[:] = myifftw(fftx_filtered[:])
+    amplitude_envelope[:] = npabs(analytic_signal[:])[:-1]
+    instantaneous_phase[:] = unwrap(angle(analytic_signal[:]))
+    instantaneous_frequency[:] = diff(instantaneous_phase[:]) / (2*pi) * fs
 
     ''' Damping time
     * amplitude damping time only half of center of mass damping time
@@ -154,22 +128,21 @@ def evaltswa(counts, bunchcurrents, clip=[38460, 87440], effort='FFTW_MEASURE', 
     '''
     beg, end = 23, 6000
     t2 = linspace(0, t[-1], N-1)[beg:end]
-    amplit = [amplitude_envelope[i, beg:end] for i in range(n)]
-    signal = [instantaneous_frequency[i, :][beg:end] for i in range(n)]
+    amplit = amplitude_envelope[beg:end]
+    signal = instantaneous_frequency[beg:end]
     fdamp = []
-    initialamp, tau_coherent = empty(n), empty(n)
-    for i in range(n):
-        '''
-        ln[A*e^(d*t)] = ln(A) + d*t
-        from linear fit: y = m*t + c we gain:
-                     A = e^c
-                     d = m
-        '''
-        M = vstack([t2, ones(len(t2))]).T
-        tau_inverse, const = linalg.lstsq(M, log(amplit[i]))[0]
-        tau_coherent[i] = -1/tau_inverse
-        initialamp[i] = exp(const)
-        fdamp.append(lambda t, Amplitude=initialamp[i], tau_coherent=tau_coherent[i]: Amplitude*exp(-t/tau_coherent))
+    initialamp, tau_coherent = empty(1), empty(1)
+    '''
+    ln[A*e^(d*t)] = ln(A) + d*t
+    from linear fit: y = m*t + c we gain:
+                 A = e^c
+                 d = m
+    '''
+    M = vstack([t2, ones(len(t2))]).T
+    tau_inverse, const = linalg.lstsq(M, log(amplit))[0]
+    tau_coherent = -1/tau_inverse
+    initialamp = exp(const)
+    fdamp = lambda t, Amplitude=initialamp, tau_coherent=tau_coherent: Amplitude*exp(-t/tau_coherent)
 
     ''' Instantaneous frequency
     * square increase over amplitude
@@ -192,17 +165,13 @@ def evaltswa(counts, bunchcurrents, clip=[38460, 87440], effort='FFTW_MEASURE', 
         filtered[1:-1] /= window[1:-1]
         return abs(filtered)
 
-    instfreq = []
-    for i in range(n):
-        #instfreq.append(filtersyn(signal[i]/1e3))
-        instfreq.append(noisefilter(t2, signal[i]/1e3, avgpts=30, smoothfac=40000))
-
+    instfreq = noisefilter(t2, signal[i]/1e3, avgpts=30, smoothfac=40000)
 
     ''' Amplitude dependant tune shift
     '''
     tswa = []
     fitfun = lambda x, a, b: a + b*x
-    for i in range(n):
+    for i in range(1):
         x = fdamp[i](t2)**2
         y = instfreq[i]
         popt, pcov = scop.curve_fit(fitfun, x, y)
@@ -249,7 +218,7 @@ def tswaplot(fig, t, t2, bbfbcntsnorm, amplit, fdamp, signal, instfreq, tswa,
 
 
 
-def tswa():
+def tswa(fig):
     data = [
         'BBQR:X:SB:RAW',             # bbfb sb measurement
         #'BBQR:Y:SB:RAW',             # bbfb sb measurement
@@ -267,17 +236,20 @@ def tswa():
         'MCLKHX251C:freq'            # masterclock of RF frequency
         ]
     data = dict(zip(data, [[] for i in range(len(data))]))
-    time = []
+    data['timestamp'] = []
     while 1:
         try:
-            time.append(str(datetime.now()))
+            data = h5load('guitswatestfile')
+            data['timestamp'].append(str(datetime.now()))
             for entry in data:
                 data[entry].append(caget(entry))
         except:
             showerror(title='epics error', message='error reading epics')
+        sig, cur = data['BBQR:X:SB:RAW'], data['TOPUPCC:rdCurCS']
         t, t2, bbfbcntsnorm, amplit, fdamp, signal, instfreq, tswa, initialamp, tau_coherent  = evaltswa(sig, cur)
-        q.put(tunstr)
-        root.event_generate('<<update_tunstrvar>>', when='tail')
+        tswaplot(fig, t, t2, bbfbcntsnorm, amplit, fdamp, signal, instfreq, tswa, initialamp, tau_coherent)
+        #q.put(tunstr)
+        #root.event_generate('<<update_tunstrvar>>', when='tail')
         sleep(1)
 
 
@@ -349,8 +321,16 @@ if __name__ == '__main__':
     strvar_tswa = StringVar()
     update_strvar_tswa = lambda event: strvar_tswa.set(q.get())
     root.bind('<<update_strvar_tswa>>', update_strvar_tswa)
-    label_tswa = Label(lf_settings, fg='blue', textvariable=strvar_tswa).grid(row=0, column=0)
+
+    cs_label(lf_settings, 0, 0, 'ROI signal', retlab=True)[1]
+    entry_roisig = cs_Strentry(lf_settings, 1, 0, '0 50000')
+
+    cs_label(lf_results, 0, 0, 'Damping Time / ms', retlab=True)[1]
+    entry_damp = cs_Strentry(lf_results, 1, 0, '')
+
     label_tswa = Label(lf_results, fg='blue', textvariable=strvar_tswa).grid(row=0, column=0)
+    clip = [int(x) for x in entry_roisig.get().split()]
+    print(clip)
 
 
     #runthread(tswa)
