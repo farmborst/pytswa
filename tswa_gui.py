@@ -188,9 +188,10 @@ def evaltswa(counts, bunchcurrents, roisig):
 
 
 def drawpatch(ax, leftx, width):
-    ylimits = ax[0].get_ylim()
+    ylimits = ax.get_ylim()
     height = ylimits[1] - ylimits[0]
-    ax.add_patch(Rectangle((ĺeftx, ylimits[0]), width, height, alpha=0.1, edgecolor="#ff0000", facecolor="#ff0000"))
+    patch = Rectangle((ĺeftx, ylimits[0]), width, height, alpha=0.1, edgecolor="#ff0000", facecolor="#ff0000")
+    ax.add_patch(patch)
 
 
 def tswaplot(ax, t, t2, bbfbcntsnorm, amplit, fdamp, signal, instfreq, tswa,
