@@ -11,19 +11,19 @@ except:
     from tkinter.ttk import Frame
     from tkinter.messagebox import showerror
 from epics import caget
-from time import sleep, strftime
+from time import sleep
 from datetime import datetime
 from threading import Thread
 from Queue import Queue
 import matplotlib
 matplotlib.use("TkAgg")
+from matplotlib.patches import Rectangle
 from matplotlib.pyplot import figure, rcdefaults, rcParams, close
 from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
                                                NavigationToolbar2TkAgg)
-from scipy.interpolate import InterpolatedUnivariateSpline
 from numpy import (linspace, arange, concatenate, pi, complex128, zeros,
                    empty, angle, unwrap, diff, abs as npabs, ones, vstack, exp,
-                   log, linalg, shape)
+                   log, linalg, shape, cos)
 from numpy.fft import fft, fftfreq, ifft
 import pyfftw
 try:
@@ -32,6 +32,8 @@ except ImportError:
     import pickle
 from layout import (cs_label, cs_Dblentry, cs_Intentry, cs_Strentry)
 from hdf5 import h5save, h5load
+from scipy.interpolate import InterpolatedUnivariateSpline
+from pandas import rolling_mean
 
 
 effort = ['FFTW_ESTIMATE', 'FFTW_MEASURE', 'FFTW_PATIENT', 'FFTW_EXHAUSTIVE']
@@ -50,16 +52,22 @@ def init_pyfftw(x, effort=effort[0], wis=False):
     return fft, ifft
 
 
+def noisefilter(t, signal, avgpts=30, smoothfac=1600):
+    smooth = rolling_mean(signal[::-1], avgpts)[::-1]
+    fspline = InterpolatedUnivariateSpline(t[:-avgpts], smooth[:-avgpts], k=4)
+    fspline.set_smoothing_factor(smoothfac)
+    return fspline(t)
+
+
 def hanning(N):
     return (cos(linspace(-pi, pi, N))+1)/2
 
 
-def evaltswa(counts, bunchcurrents):
-    roisig = [38460, 87440]
+def evaltswa(counts, bunchcurrents, roisig):
     beg, end = roisig
-    counts = counts[0, beg:end]
+    counts = counts[beg:end]
 
-    N = shape(counts)[1]      # number of points taken per measurement
+    N = len(counts)      # number of points taken per measurement
     fs = 1.2495*1e6           # sampling frequency in Hz
     dt = 1/fs
     t = arange(N)*dt*1e3  # time in ms
@@ -68,7 +76,7 @@ def evaltswa(counts, bunchcurrents):
 
     with open('calib_InterpolatedUnivariateSpline.pkl', 'rb') as fh:
         calib = pickle.load(fh)
-    bbfbpos = calib(bbfbcntsnorm[0, :])
+    bbfbpos = calib(bbfbcntsnorm)
 
     # Turn on the cache for optimum pyfftw performance
     pyfftw.interfaces.cache.enable()
@@ -165,89 +173,82 @@ def evaltswa(counts, bunchcurrents):
         filtered[1:-1] /= window[1:-1]
         return abs(filtered)
 
-    instfreq = noisefilter(t2, signal[i]/1e3, avgpts=30, smoothfac=40000)
+    instfreq = noisefilter(t2, signal/1e3, avgpts=30, smoothfac=40000)
 
     ''' Amplitude dependant tune shift
     '''
-    tswa = []
     fitfun = lambda x, a, b: a + b*x
-    for i in range(1):
-        x = fdamp[i](t2)**2
-        y = instfreq[i]
-        popt, pcov = scop.curve_fit(fitfun, x, y)
-        tswa.append(popt)
+    x = fdamp(t2)**2
+    y = instfreq
+    popt, pcov = scop.curve_fit(fitfun, x, y)
+    tswa = popt
 
     return (t, t2, bbfbpos, amplit, fdamp, signal, instfreq, tswa,
             initialamp, tau_coherent)
 
 
-def tswaplot(fig, t, t2, bbfbcntsnorm, amplit, fdamp, signal, instfreq, tswa,
+def drawpatch(ax, leftx, width):
+    ylimits = ax[0].get_ylim()
+    height = ylimits[1] - ylimits[0]
+    ax.add_patch(Rectangle((ĺeftx, ylimits[0]), width, height, alpha=0.1, edgecolor="#ff0000", facecolor="#ff0000"))
+
+
+def tswaplot(ax, t, t2, bbfbcntsnorm, amplit, fdamp, signal, instfreq, tswa,
              initialamp, tau_coherent):
     i = 0
-    ax = fig.add_subplot(221)
-    ax.plot(t, bbfbcntsnorm[0][:], label='signal')
-    ax.set_ylim([-15, 15])
-    ax.set_xlim([0, 5])
-    ax.legend(fancybox=True, loc=0).get_frame().set_alpha(.5)
-    ax.set_xlabel('time / (ms)')
-    ax.set_ylabel('offset / (mm)')
 
-    ax = fig.add_subplot(222)
-    ax.plot(t2, amplit[i], label='amplitude')
-    ax.plot(t2, fdamp[i](t2), '-r', label='y = A$\cdot$exp(-t/tau )$\n   A = {0:.3}\n   tau = {1:.3}'.format(initialamp[i], tau_coherent[i]))
-    ax.legend(fancybox=True, loc=0).get_frame().set_alpha(.5)
-    ax.set_xlabel('time / (ms)')
-    ax.set_ylabel('betatron amplitude / (mm)')
-    ax.set_xlim([0, 5])
+    ax[0].plot(t, bbfbcntsnorm[0][:], label='signal')
+    ax[0].legend(fancybox=True, loc=0).get_frame().set_alpha(.5)
 
-    ax = fig.add_subplot(223)
-    ax.plot(t2, signal[i]/1e3, '-b', label='instantaneous frequency')
-    ax.plot(t2, instfreq[i], '-r', label='synchrotron tune and noise filtered')
-    ax.legend(fancybox=True, loc=0).get_frame().set_alpha(.5)
-    ax.set_xlabel('time / (ms))')
-    ax.set_ylabel('frequency / (kHz)')
-    ax.set_xlim([0, 5])
+    ax[1].plot(t2, amplit[0], label='amplitude')
+    ax[1].plot(t2, fdamp[0](t2), '-r', label='y = A$\cdot$exp(-t/tau )$\n   A = {0:.3}\n   tau = {1:.3}'.format(initialamp[i], tau_coherent[i]))
+    ax[1].legend(fancybox=True, loc=0).get_frame().set_alpha(.5)
+
+    ax[2].plot(t2, signal[i]/1e3, '-b', label='instantaneous frequency')
+    ax[2].plot(t2, instfreq[i], '-r', label='synchrotron tune and noise filtered')
+    ax[2].legend(fancybox=True, loc=0).get_frame().set_alpha(.5)
 
     fitfun = lambda x, a, b: a + b*x
-    ax = fig.add_subplot(224)
-    ax.plot(fdamp[i](t2)**2, instfreq[i], '-b', label='tuneshift with amplitude')
-    ax.plot(fdamp[i](t2)**2, fitfun(fdamp[i](t2)**2, *tswa[i]), '-r', label=('y = a + b$\cdot$x\n    a={0:.4}\n    b={1:.3} Hz/mm$^2$').format(tswa[i][0], tswa[i][1]*1e3))
-    ax.legend(fancybox=True, loc=0).get_frame().set_alpha(.5)
-    ax.set_xlabel(r'square amplitude / $(mm^2)$')
-    ax.set_ylabel('frequency / (kHz)')
+    ax[3].plot(fdamp[i](t2)**2, instfreq[i], '-b', label='tuneshift with amplitude')
+    ax[3].plot(fdamp[i](t2)**2, fitfun(fdamp[i](t2)**2, *tswa[i]), '-r', label=('y = a + b$\cdot$x\n    a={0:.4}\n    b={1:.3} Hz/mm$^2$').format(tswa[i][0], tswa[i][1]*1e3))
+    ax[3].legend(fancybox=True, loc=0).get_frame().set_alpha(.5)
 
 
 
-def tswa(fig):
-    data = [
-        'BBQR:X:SB:RAW',             # bbfb sb measurement
-        #'BBQR:Y:SB:RAW',             # bbfb sb measurement
-        #'BBQR:Z:SB:RAW',             # bbfb sb measurement
-        'BBQR:X:SRAM:MEAN',          # bbfb measurement
-        #'BBQR:Y:SRAM:MEAN',          # bbfb measurement
-        #'BBQR:Z:SRAM:MEAN',          # bbfb measurement
-        'BPMZ1D5R:rdX',              # bbfb bpm position
-        'BPMZ1D5R:rdY',              # bbfb bpm position
-        'PKIK1D1R:set',              # kicker strength
-        'PKIK3D1R:set',              # kicker strength
-        'CUMZR:rdCur',               # total storage ring current
-        'TOPUPCC:rdCurCS',           # single bunch current
-        'CUMZR:MBcurrent',           # fillpattern
-        'MCLKHX251C:freq'            # masterclock of RF frequency
-        ]
-    data = dict(zip(data, [[] for i in range(len(data))]))
-    data['timestamp'] = []
+def tswa(axes, entry_roisig):
+#    data = [
+#        'BBQR:X:SB:RAW',             # bbfb sb measurement
+#        #'BBQR:Y:SB:RAW',             # bbfb sb measurement
+#        #'BBQR:Z:SB:RAW',             # bbfb sb measurement
+#        'BBQR:X:SRAM:MEAN',          # bbfb measurement
+#        #'BBQR:Y:SRAM:MEAN',          # bbfb measurement
+#        #'BBQR:Z:SRAM:MEAN',          # bbfb measurement
+#        'BPMZ1D5R:rdX',              # bbfb bpm position
+#        'BPMZ1D5R:rdY',              # bbfb bpm position
+#        'PKIK1D1R:set',              # kicker strength
+#        'PKIK3D1R:set',              # kicker strength
+#        'CUMZR:rdCur',               # total storage ring current
+#        'TOPUPCC:rdCurCS',           # single bunch current
+#        'CUMZR:MBcurrent',           # fillpattern
+#        'MCLKHX251C:freq'            # masterclock of RF frequency
+#        ]
+#    data = dict(zip(data, [[] for i in range(len(data))]))
+#    data['timestamp'] = []
+#    while 1:
+#        try:
+#            data['timestamp'].append(str(datetime.now()))
+#            for entry in data:
+#                data[entry].append(caget(entry))
+#        except:
+#            showerror(title='epics error', message='error reading epics')
     while 1:
-        try:
-            data = h5load('guitswatestfile')
-            data['timestamp'].append(str(datetime.now()))
-            for entry in data:
-                data[entry].append(caget(entry))
-        except:
-            showerror(title='epics error', message='error reading epics')
+        roisig = [int(x) for x in entry_roisig.get().split()]
+        data = h5load('guitswatestfile', False)
         sig, cur = data['BBQR:X:SB:RAW'], data['TOPUPCC:rdCurCS']
-        t, t2, bbfbcntsnorm, amplit, fdamp, signal, instfreq, tswa, initialamp, tau_coherent  = evaltswa(sig, cur)
-        tswaplot(fig, t, t2, bbfbcntsnorm, amplit, fdamp, signal, instfreq, tswa, initialamp, tau_coherent)
+        print(shape(sig))
+        print(shape(cur))
+        t, t2, bbfbcntsnorm, amplit, fdamp, signal, instfreq, tswa, initialamp, tau_coherent = evaltswa(sig, cur, roisig)
+        tswaplot(axes, t, t2, bbfbcntsnorm, amplit, fdamp, signal, instfreq, tswa, initialamp, tau_coherent)
         #q.put(tunstr)
         #root.event_generate('<<update_tunstrvar>>', when='tail')
         sleep(1)
@@ -270,12 +271,25 @@ def initfigs(tabs):
         for widget in tab.winfo_children():
             widget.destroy()
         fig = figure()
+        axes = [fig.add_subplot(2, 2, i+1) for i in range(4)]
+        xlabs = ['time / (ms)',
+                 'time / (ms)',
+                 'time / (ms))',
+                 r'square amplitude / $(mm^2)$']
+        ylabs = ['offset / (mm)',
+                 'betatron amplitude / (mm)',
+                 'frequency / (kHz)',
+                 'frequency / (kHz)']
+        for ax, xlab, ylab in zip(axes, xlabs, ylabs):
+            ax.set_xlabel(xlab)
+            ax.set_ylabel(ylab)
+            ax.grid()
         canvas = FigureCanvasTkAgg(fig, master=tab)
         figs.append(fig)
         toolbar = NavigationToolbar2TkAgg(canvas, tab)
         canvas.get_tk_widget().pack()
         toolbar.pack()
-    return figs
+    return figs, axes
 
 
 if __name__ == '__main__':
@@ -315,7 +329,7 @@ if __name__ == '__main__':
               'xtick.labelsize': 10,
               'ytick.labelsize': 10}
     rcParams.update(params)
-    fig = initfigs([lf_plots])
+    axes = initfigs([lf_plots])[1]
 
     q = Queue()
     strvar_tswa = StringVar()
@@ -324,15 +338,13 @@ if __name__ == '__main__':
 
     cs_label(lf_settings, 0, 0, 'ROI signal', retlab=True)[1]
     entry_roisig = cs_Strentry(lf_settings, 1, 0, '0 50000')
+    # roisig = [38460, 87440]
 
     cs_label(lf_results, 0, 0, 'Damping Time / ms', retlab=True)[1]
     entry_damp = cs_Strentry(lf_results, 1, 0, '')
 
     label_tswa = Label(lf_results, fg='blue', textvariable=strvar_tswa).grid(row=0, column=0)
-    clip = [int(x) for x in entry_roisig.get().split()]
-    print(clip)
 
-
-    #runthread(tswa)
+    runthread(tswa, (axes, entry_roisig))
 
     mainloop()
