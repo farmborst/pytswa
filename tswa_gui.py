@@ -321,10 +321,10 @@ if __name__ == '__main__':
     configs['roidamp'] = cs_Strentry(lf_settings, 3, 0, '23 6000')
 
     results = {}
-    cs_label(lf_results, 0, 0, 'Damping Time / (ms)')
+    cs_label(lf_results, 0, 0, 'Damping Time / (ms)', grid_conf={'sticky' : 'W'})
     results['tau'] = cs_label(lf_results, 1, 0, 'nan', label_conf={'fg' : 'green'})[0]
 
-    cs_label(lf_results, 2, 0, 'Tune Shift With Amplitude / (Hz/mm'+u'\u00B2'+')')
+    cs_label(lf_results, 2, 0, 'Tune Shift With Amplitude / (Hz/mm'+u'\u00B2'+')', grid_conf={'sticky' : 'W'})
     results['tswa'] = cs_label(lf_results, 3, 0, 'nan', label_conf={'fg' : 'blue'})[0]
 
     cs_label(lf_results, 4, 0, 'Measurement Nr.')
