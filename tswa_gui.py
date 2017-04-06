@@ -23,17 +23,18 @@ from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
                                                NavigationToolbar2TkAgg)
 from numpy import (linspace, arange, concatenate, pi, complex128, zeros,
                    empty, angle, unwrap, diff, abs as npabs, ones, vstack, exp,
-                   log, linalg, shape, cos)
-from numpy.fft import fft, fftfreq, ifft
+                   log, linalg, cos, polyfit, poly1d, sqrt, diag)
 import pyfftw
 try:
     import cPickle as pickle
 except ImportError:
     import pickle
-from layout import (cs_label, cs_Dblentry, cs_Intentry, cs_Strentry)
-from hdf5 import h5save, h5load
+from layout import (cs_label, cs_Dblentry, cs_Intentry, cs_Strentry,
+                    cs_checkbox)
+from hdf5 import h5load
 from scipy.interpolate import InterpolatedUnivariateSpline
 from pandas import rolling_mean
+from scipy.optimize import curve_fit
 
 
 effort = ['FFTW_ESTIMATE', 'FFTW_MEASURE', 'FFTW_PATIENT', 'FFTW_EXHAUSTIVE']
@@ -63,14 +64,22 @@ def hanning(N):
     return (cos(linspace(-pi, pi, N))+1)/2
 
 
-def evaltswa(counts, bunchcurrents, roisig):
+def drawpatch(ax, leftx, width):
+    ylimits = ax.get_ylim()
+    height = ylimits[1] - ylimits[0]
+    patch = Rectangle((leftx, ylimits[0]), width, height, alpha=0.1, edgecolor="#ff0000", facecolor="#ff0000")
+    ax.add_patch(patch)
+
+
+def tswa(lines, counts, bunchcurrents, roisig, roidamp, fitorder=1):
     beg, end = roisig
     counts = counts[beg:end]
 
     N = len(counts)      # number of points taken per measurement
     fs = 1.2495*1e6           # sampling frequency in Hz
     dt = 1/fs
-    t = arange(N)*dt*1e3  # time in ms
+    turns = arange(N)
+    t = turns*dt*1e3  # time in ms
 
     bbfbcntsnorm = (counts.T/bunchcurrents).T
 
@@ -125,21 +134,11 @@ def evaltswa(counts, bunchcurrents, roisig):
     instantaneous_phase[:] = unwrap(angle(analytic_signal[:]))
     instantaneous_frequency[:] = diff(instantaneous_phase[:]) / (2*pi) * fs
 
-    ''' Damping time
-    * amplitude damping time only half of center of mass damping time
-    * chromaticity dependant
-    * in horizontal plane dispersion and energy dependant
-    * dephasing
-    * landau damping
-    * head tail damping
-        > analytic two particle modell shows directional interaction from head to tail and position interchange
-    '''
-    beg, end = 23, 6000
+    # Damping time
+    beg, end = roidamp
     t2 = linspace(0, t[-1], N-1)[beg:end]
     amplit = amplitude_envelope[beg:end]
-    signal = instantaneous_frequency[beg:end]
-    fdamp = []
-    initialamp, tau_coherent = empty(1), empty(1)
+    signal = instantaneous_frequency[beg:end]/1e3
     '''
     ln[A*e^(d*t)] = ln(A) + d*t
     from linear fit: y = m*t + c we gain:
@@ -150,73 +149,55 @@ def evaltswa(counts, bunchcurrents, roisig):
     tau_inverse, const = linalg.lstsq(M, log(amplit))[0]
     tau_coherent = -1/tau_inverse
     initialamp = exp(const)
-    fdamp = lambda t, Amplitude=initialamp, tau_coherent=tau_coherent: Amplitude*exp(-t/tau_coherent)
+    fdamp = initialamp*exp(-t2/tau_coherent)
+    fdamp2 = fdamp**2
 
-    ''' Instantaneous frequency
-    * square increase over amplitude
-    * frequency is overlayed with synchrotron frequency (~7kHz)
-    * filter out synchrotron frequency with a bandstop filter -> tricky (bad snr in fft)
-    * fit assumed square funtion -> wrong
-    f(amp) = a + b*amp**2 (+ c*amp**4 + d*amp**6)
-    amp(t) = A*exp(-t/tau) -> tau
-    f(t) = a + b*exp(-2*t/tau) (+ c*exp(-4*t/tau) + d*exp(-6*t/tau))
-    '''
-    dt = t2[1] - t2[0]   # ms
-    def filtersyn(f):
-        N = len(f)
-        window = hanning(N)
-        f = f*window
-        fourier = fft(f)
-        freqs = fftfreq(N, d=dt)
-        fourier[abs(freqs) > 5] = 0
-        filtered = ifft(fourier)
-        filtered[1:-1] /= window[1:-1]
-        return abs(filtered)
+    # Instantaneous frequency
+    instfreq = noisefilter(t2, signal, avgpts=30, smoothfac=40000)
 
-    instfreq = noisefilter(t2, signal/1e3, avgpts=30, smoothfac=40000)
+    # Amplitude dependant tune shift
+    popt, pcov = polyfit(fdamp2, instfreq, fitorder, cov=True)
+    errs = sqrt(diag(pcov))
 
-    ''' Amplitude dependant tune shift
-    '''
-    fitfun = lambda x, a, b: a + b*x
-    x = fdamp(t2)**2
-    y = instfreq
-    popt, pcov = scop.curve_fit(fitfun, x, y)
-    tswa = popt
+    lines[0][0].set_data(turns, bbfbcntsnorm)
 
-    return (t, t2, bbfbpos, amplit, fdamp, signal, instfreq, tswa,
-            initialamp, tau_coherent)
+    lines[1][0].set_data(t2, amplit)
+    lines[1][1].set_data(t2, fdamp)
+
+    lines[2][0].set_data(t2, signal)
+    lines[2][1].set_data(t2, instfreq)
+
+    lines[3][0].set_data(fdamp2, instfreq)
+    lines[3][1].set_data(fdamp2, poly1d(popt)(fdamp2))
+    return tau_coherent, [popt[0]*1e3, errs[0]*1e3]
 
 
-def drawpatch(ax, leftx, width):
-    ylimits = ax.get_ylim()
-    height = ylimits[1] - ylimits[0]
-    patch = Rectangle((ĺeftx, ylimits[0]), width, height, alpha=0.1, edgecolor="#ff0000", facecolor="#ff0000")
-    ax.add_patch(patch)
+def tswaloop(fig, axes, lines, configs, results, epics):
+    pnt = 0
+    while 1:
+        if epics['write'].get():
+            print(epics['tau'].get())
+            print(epics['tswa'].get())
+            print(epics['pnt'].get())
+            # print(epics[''].get())
+        pnt += 1
+        roisig = [int(x) for x in configs['roisig'].get().split()]
+        roidamp = [int(x) for x in configs['roidamp'].get().split()]
 
+        data = h5load('guitswatestfile', False)
+        sig, cur = data['BBQR:X:SB:RAW'], data['TOPUPCC:rdCurCS']
 
-def tswaplot(ax, t, t2, bbfbcntsnorm, amplit, fdamp, signal, instfreq, tswa,
-             initialamp, tau_coherent):
-    i = 0
-
-    ax[0].plot(t, bbfbcntsnorm[0][:], label='signal')
-    ax[0].legend(fancybox=True, loc=0).get_frame().set_alpha(.5)
-
-    ax[1].plot(t2, amplit[0], label='amplitude')
-    ax[1].plot(t2, fdamp[0](t2), '-r', label='y = A$\cdot$exp(-t/tau )$\n   A = {0:.3}\n   tau = {1:.3}'.format(initialamp[i], tau_coherent[i]))
-    ax[1].legend(fancybox=True, loc=0).get_frame().set_alpha(.5)
-
-    ax[2].plot(t2, signal[i]/1e3, '-b', label='instantaneous frequency')
-    ax[2].plot(t2, instfreq[i], '-r', label='synchrotron tune and noise filtered')
-    ax[2].legend(fancybox=True, loc=0).get_frame().set_alpha(.5)
-
-    fitfun = lambda x, a, b: a + b*x
-    ax[3].plot(fdamp[i](t2)**2, instfreq[i], '-b', label='tuneshift with amplitude')
-    ax[3].plot(fdamp[i](t2)**2, fitfun(fdamp[i](t2)**2, *tswa[i]), '-r', label=('y = a + b$\cdot$x\n    a={0:.4}\n    b={1:.3} Hz/mm$^2$').format(tswa[i][0], tswa[i][1]*1e3))
-    ax[3].legend(fancybox=True, loc=0).get_frame().set_alpha(.5)
-
-
-
-def tswa(axes, entry_roisig):
+        res_tau, res_tswa = tswa(lines, sig, cur, roisig, roidamp)
+        for ax in axes:
+            ax.relim()
+            ax.autoscale_view(tight=True, scalex=True, scaley=True)
+        fig.canvas.draw()
+        results['tau'].set('{:.2f}'.format(res_tau))
+        results['tswa'].set(('{0:.2f} ' + u'\u00B1' + ' {1:.2f}').format(res_tswa[0], res_tswa[1]))
+        results['pnt'].set(pnt)
+        # q.put(tunstr)
+        # root.event_generate('<<update_tunstrvar>>', when='tail')
+        sleep(1)
 #    data = [
 #        'BBQR:X:SB:RAW',             # bbfb sb measurement
 #        #'BBQR:Y:SB:RAW',             # bbfb sb measurement
@@ -242,17 +223,6 @@ def tswa(axes, entry_roisig):
 #                data[entry].append(caget(entry))
 #        except:
 #            showerror(title='epics error', message='error reading epics')
-    while 1:
-        roisig = [int(x) for x in entry_roisig.get().split()]
-        data = h5load('guitswatestfile', False)
-        sig, cur = data['BBQR:X:SB:RAW'], data['TOPUPCC:rdCurCS']
-        print(shape(sig))
-        print(shape(cur))
-        t, t2, bbfbcntsnorm, amplit, fdamp, signal, instfreq, tswa, initialamp, tau_coherent = evaltswa(sig, cur, roisig)
-        tswaplot(axes, t, t2, bbfbcntsnorm, amplit, fdamp, signal, instfreq, tswa, initialamp, tau_coherent)
-        #q.put(tunstr)
-        #root.event_generate('<<update_tunstrvar>>', when='tail')
-        sleep(1)
 
 
 def runthread(fun, argstuple):
@@ -273,15 +243,21 @@ def initfigs(tabs):
             widget.destroy()
         fig = figure()
         axes = [fig.add_subplot(2, 2, i+1) for i in range(4)]
-        xlabs = ['time / (ms)',
+        xlabs = ['turns',
                  'time / (ms)',
                  'time / (ms))',
                  r'square amplitude / $(mm^2)$']
-        ylabs = ['offset / (mm)',
+        ylabs = ['ADC counts',
                  'betatron amplitude / (mm)',
                  'frequency / (kHz)',
                  'frequency / (kHz)']
-        for ax, xlab, ylab in zip(axes, xlabs, ylabs):
+        stylesets = [['-b'],
+                     ['-b', '-r'],
+                     ['-b', '-r'],
+                     ['-b', '-r']]
+        lines = []
+        for ax, xlab, ylab, styles in zip(axes, xlabs, ylabs, stylesets):
+            lines.append([ax.plot([], [], style)[0] for style in styles])
             ax.set_xlabel(xlab)
             ax.set_ylabel(ylab)
             ax.grid()
@@ -290,7 +266,7 @@ def initfigs(tabs):
         toolbar = NavigationToolbar2TkAgg(canvas, tab)
         canvas.get_tk_widget().pack()
         toolbar.pack()
-    return figs, axes
+    return figs, axes, lines
 
 
 if __name__ == '__main__':
@@ -299,13 +275,14 @@ if __name__ == '__main__':
     frame = Frame(root)
     frame.pack(fill=BOTH, expand=True)
     lf_settings = LabelFrame(frame, text="Settings", padx=5, pady=5)
-    lf_settings.grid(row=0, column=0, sticky=W+E+N+S, padx=10, pady=10)
+    lf_settings.grid(row=0, column=0, columnspan=2, sticky=W+E+N+S, padx=10, pady=10)
     lf_results = LabelFrame(frame, text="Results", padx=5, pady=5)
-    lf_results.grid(row=1, column=0, rowspan=2, sticky=W+E+N+S, padx=10, pady=10)
+    lf_results.grid(row=1, column=0, sticky=W+E+N+S, padx=10, pady=10)
+    lf_epics = LabelFrame(frame, text="EPICS", padx=5, pady=5)
+    lf_epics.grid(row=1, column=1, sticky=W+E+N+S, padx=10, pady=10)
     lf_plots = LabelFrame(frame, text="Matplotlib", padx=5, pady=5)
-    lf_plots.grid(row=0, column=1, rowspan=2, sticky=W+E+N+S, padx=10, pady=10)
+    lf_plots.grid(row=0, column=2, rowspan=2, sticky=W+E+N+S, padx=10, pady=10)
 
-    rcParams['text.usetex'] = True
     rcdefaults()
     params = {'axes.labelsize': 10,
               'axes.titlesize': 10,
@@ -330,22 +307,37 @@ if __name__ == '__main__':
               'xtick.labelsize': 10,
               'ytick.labelsize': 10}
     rcParams.update(params)
-    axes = initfigs([lf_plots])[1]
+    figs, axes, lines = initfigs([lf_plots])
 
     q = Queue()
     strvar_tswa = StringVar()
     update_strvar_tswa = lambda event: strvar_tswa.set(q.get())
     root.bind('<<update_strvar_tswa>>', update_strvar_tswa)
 
-    cs_label(lf_settings, 0, 0, 'ROI signal', retlab=True)[1]
-    entry_roisig = cs_Strentry(lf_settings, 1, 0, '0 50000')
-    # roisig = [38460, 87440]
+    configs = {}
+    cs_label(lf_settings, 0, 0, 'ROI signal')
+    configs['roisig'] = cs_Strentry(lf_settings, 1, 0, '38460 87440')
+    cs_label(lf_settings, 2, 0, 'ROI betatron amplitude')
+    configs['roidamp'] = cs_Strentry(lf_settings, 3, 0, '23 6000')
 
-    cs_label(lf_results, 0, 0, 'Damping Time / ms', retlab=True)[1]
-    entry_damp = cs_Strentry(lf_results, 1, 0, '')
+    results = {}
+    cs_label(lf_results, 0, 0, 'Damping Time / (ms)')
+    results['tau'] = cs_label(lf_results, 1, 0, 'nan', label_conf={'fg' : 'green'})[0]
 
-    label_tswa = Label(lf_results, fg='blue', textvariable=strvar_tswa).grid(row=0, column=0)
+    cs_label(lf_results, 2, 0, 'Tune Shift With Amplitude / (Hz/mm'+u'\u00B2'+')')
+    results['tswa'] = cs_label(lf_results, 3, 0, 'nan', label_conf={'fg' : 'blue'})[0]
 
-    runthread(tswa, (axes, entry_roisig))
+    cs_label(lf_results, 4, 0, 'Measurement Nr.')
+    results['pnt'] = cs_label(lf_results, 5, 0, 'nan')[0]
+
+
+    epics = {}
+    cs_label(lf_epics, 0, 0, 'Write')
+    epics['write'] = cs_checkbox(lf_epics, 0, 1, 'Write', False)
+    epics['tau'] = cs_Strentry(lf_epics, 1, 0, 'FKC00V', columnspan=2)
+    epics['tswa'] = cs_Strentry(lf_epics, 3, 0, 'FKC01V', columnspan=2)
+    epics['pnt'] = cs_Strentry(lf_epics, 5, 0, 'FKC02V', columnspan=2)
+
+    runthread(tswaloop, (figs[0], axes, lines, configs, results, epics))
 
     mainloop()

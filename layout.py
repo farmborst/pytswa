@@ -12,13 +12,6 @@ except:
     from tkinter.ttk import (Notebook, Frame)
 
 
-def gridwidget(widget, r, c, sticky):
-    if sticky is None:
-        widget.grid(row=r, column=c)
-    else:
-        widget.grid(row=r, column=c, sticky=sticky)
-
-
 def packwidget(button, side, fill, expand):
     button.pack(side=side, fill=fill, expand=expand)
 
@@ -60,44 +53,41 @@ def cs_dbl(value):
 
 
 # create, position and set tkinter label
-def cs_label(root, r, c, name, sticky=None, retlab=False, fg=None):
+def cs_label(root, r, c, name, label_conf={}, grid_conf={}):
     labelstr = cs_str(name)
-    label = Label(master=root, textvariable=labelstr, fg=fg)
-    gridwidget(label, r, c, sticky)
-    if retlab:
-        return labelstr, label
-    else:
-        return labelstr
+    label = Label(master=root, textvariable=labelstr, **label_conf)
+    label.grid(row=r, column=c, **grid_conf)
+    return labelstr, label
 
 
 # create, position and set IntVar label
-def cs_Intentry(root, r, c, value, sticky=None):
+def cs_Intentry(root, r, c, value, **kwargs):
     entryint = cs_int(value)
     entry = Entry(root, textvariable=entryint)
-    gridwidget(entry, r, c, sticky)
+    entry.grid(row=r, column=c, **kwargs)
     return entry
 
 
 # create, position and set DoubleVar label
-def cs_Dblentry(root, r, c, value, sticky=None):
+def cs_Dblentry(root, r, c, value, **kwargs):
     entryint = cs_dbl(value)
     entry = Entry(root, textvariable=entryint)
-    gridwidget(entry, r, c, sticky)
+    entry.grid(row=r, column=c, **kwargs)
     return entry
 
 
 # create, position and set StringVar label
-def cs_Strentry(root, r, c, value, sticky=None):
+def cs_Strentry(root, r, c, value, **kwargs):
     entrystr = cs_str(value)
     entry = Entry(root, textvariable=entrystr)
-    gridwidget(entry, r, c, sticky)
+    entry.grid(row=r, column=c, **kwargs)
     return entry
 
 
 # create, position and set button
-def cs_button(root, r, c, label, action, sticky=None):
+def cs_button(root, r, c, label, action, **kwargs):
     button = Button(master=root, text=label, command=action)
-    gridwidget(button, r, c, sticky)
+    button.grid(row=r, column=c, **kwargs)
     return button
 
 
@@ -109,18 +99,17 @@ def cp_button(root, label, action, side="top", fill="both", expand=True):
 
 
 # create, position and set button
-def cs_checkbox(root, r, c, label, boolval, sticky=None):
+def cs_checkbox(root, r, c, label, boolval, **kwargs):
     entrybl = cs_bln(boolval)
     checkbox = Checkbutton(master=root, text=label, onvalue=True, offvalue=False, variable=entrybl)
-    gridwidget(checkbox, r, c, sticky)
+    checkbox.grid(row=r, column=c, **kwargs)
     return entrybl
 
-def cs_dropd(root, r, c, options, action=None, sticky=None, retbut=False):
+
+def cs_dropd(root, r, c, options, action=None, **kwargs):
     startvalue = cs_str('')  # cs_str(options[0])
     dropdown = OptionMenu(root, startvalue, *options)
-    gridwidget(dropdown, r, c, sticky)
+    dropdown.grid(row=r, column=c, **kwargs)
     if action is not None:
         startvalue.trace('w', action)
-    if retbut:
-        return startvalue, dropdown
-    return startvalue
+    return startvalue, dropdown
