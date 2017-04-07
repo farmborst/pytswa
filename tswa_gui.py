@@ -3,17 +3,19 @@
 # ssh-keygen -t rsa -b 4096 -C "your_email@example.com"
 from __future__ import print_function, division
 try:
-    from Tkinter import (Tk, mainloop, StringVar, Label, Button, N, E, S, W, LabelFrame, _setit, BOTH)
+    from Tkinter import Tk, StringVar, N, E, S, W, LabelFrame, BOTH
     from ttk import Frame
-    from tkMessageBox import showerror
-except:
-    from tkinter import (Tk, mainloop, StringVar, Label, Button, N, E, S, W, LabelFrame, _setit, BOTH)
+    from tkMessageBox import showerror, askokcancel
+    import cPickle as pickle
+except ImportError:
+    from tkinter import Tk, StringVar, N, E, S, W, LabelFrame, BOTH
     from tkinter.ttk import Frame
-    from tkinter.messagebox import showerror
-from epics import caget
+    from tkinter.messagebox import showerror, askokcancel
+    import pickle
+from epics import caget, caput
 from time import sleep
 from datetime import datetime
-from threading import Thread
+from threading import Thread, Event
 from Queue import Queue
 import matplotlib
 matplotlib.use("TkAgg")
@@ -24,17 +26,11 @@ from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
 from numpy import (linspace, arange, concatenate, pi, complex128, zeros,
                    empty, angle, unwrap, diff, abs as npabs, ones, vstack, exp,
                    log, linalg, cos, polyfit, poly1d, sqrt, diag)
-import pyfftw
-try:
-    import cPickle as pickle
-except ImportError:
-    import pickle
-from layout import (cs_label, cs_Dblentry, cs_Intentry, cs_Strentry,
-                    cs_checkbox)
+import pyfftw   
+from layout import (cs_label, cs_Strentry, cs_checkbox)
 from hdf5 import h5load
 from scipy.interpolate import InterpolatedUnivariateSpline
 from pandas import rolling_mean
-from scipy.optimize import curve_fit
 
 
 effort = ['FFTW_ESTIMATE', 'FFTW_MEASURE', 'FFTW_PATIENT', 'FFTW_EXHAUSTIVE']
@@ -75,7 +71,7 @@ def tswa(lines, counts, bunchcurrents, roisig, roidamp, fitorder=1):
     beg, end = roisig
     counts = counts[beg:end]
 
-    N = len(counts)      # number of points taken per measurement
+    N = len(counts)           # number of points taken per measurement
     fs = 1.2495*1e6           # sampling frequency in Hz
     dt = 1/fs
     turns = arange(N)
@@ -172,32 +168,37 @@ def tswa(lines, counts, bunchcurrents, roisig, roidamp, fitorder=1):
     return tau_coherent, [popt[0]*1e3, errs[0]*1e3]
 
 
-def tswaloop(fig, axes, lines, configs, results, epics):
+def tswaloop(stop_threads, fig, axes, lines, configs, results, epics):
     pnt = 0
-    while 1:
-        if epics['write'].get():
-            print(epics['tau'].get())
-            print(epics['tswa'].get())
-            print(epics['pnt'].get())
-            # print(epics[''].get())
+    while not stop_threads.is_set():
         pnt += 1
-        roisig = [int(x) for x in configs['roisig'].get().split()]
-        roidamp = [int(x) for x in configs['roidamp'].get().split()]
+        roisig = [int(x.get()) for x in configs['roisig']]
+        roidamp = [int(x.get()) for x in configs['roidamp']]
 
         data = h5load('guitswatestfile', False)
         sig, cur = data['BBQR:X:SB:RAW'], data['TOPUPCC:rdCurCS']
 
         res_tau, res_tswa = tswa(lines, sig, cur, roisig, roidamp)
+        
+        if epics['write_tau'].get():
+            caput(epics['tau'].get(), res_tau)
+            caput(epics['tswa'].get(), res_tswa[0])
+            
+            print(epics['tswa'].get())
+            print(epics['pnt'].get())
+            # print(epics[''].get())        
+        
         for ax in axes:
             ax.relim()
             ax.autoscale_view(tight=True, scalex=True, scaley=True)
         fig.canvas.draw()
-        results['tau'].set('{:.2f}'.format(res_tau))
-        results['tswa'].set(('{0:.2f} ' + u'\u00B1' + ' {1:.2f}').format(res_tswa[0], res_tswa[1]))
+        results['tau'].set('{:.2f} ms'.format(res_tau))
+        results['tswa'].set(('{0:.2f} ' + u'\u00B1' + ' {1:.2f} Hz/mm' + u'\u00B2').format(res_tswa[0], res_tswa[1]))
         results['pnt'].set(pnt)
         # q.put(tunstr)
         # root.event_generate('<<update_tunstrvar>>', when='tail')
         sleep(1)
+    print('goodbye!')
 #    data = [
 #        'BBQR:X:SB:RAW',             # bbfb sb measurement
 #        #'BBQR:Y:SB:RAW',             # bbfb sb measurement
@@ -232,6 +233,7 @@ def runthread(fun, argstuple):
     t_run.setDaemon(True)
     # start thread
     t_run.start()
+    return t_run
 
 
 def initfigs(tabs):
@@ -260,7 +262,7 @@ def initfigs(tabs):
             lines.append([ax.plot([], [], style)[0] for style in styles])
             ax.set_xlabel(xlab)
             ax.set_ylabel(ylab)
-            ax.grid()
+            ax.grid(True)
         canvas = FigureCanvasTkAgg(fig, master=tab)
         figs.append(fig)
         toolbar = NavigationToolbar2TkAgg(canvas, tab)
@@ -269,7 +271,7 @@ def initfigs(tabs):
     return figs, axes, lines
 
 
-if __name__ == '__main__':
+if __name__ == '__main__': 
     root = Tk()
     root.title('Tuneshift with ampltiude measurement')
     frame = Frame(root)
@@ -315,29 +317,66 @@ if __name__ == '__main__':
     root.bind('<<update_strvar_tswa>>', update_strvar_tswa)
 
     configs = {}
-    cs_label(lf_settings, 0, 0, 'ROI signal')
-    configs['roisig'] = cs_Strentry(lf_settings, 1, 0, '38460 87440')
-    cs_label(lf_settings, 2, 0, 'ROI betatron amplitude')
-    configs['roidamp'] = cs_Strentry(lf_settings, 3, 0, '23 6000')
+    configs['roisig'] = []
+    configs['roidamp'] = []
+    cs_label(lf_settings, 0, 0, 'ROI signal', grid_conf={'columnspan' : '3', 'sticky' : 'W'})
+    configs['roisig'].append(cs_Strentry(lf_settings, 1, 0, '38460', entry_conf={'width' : '6'}))
+    cs_label(lf_settings, 1, 1, '-')
+    configs['roisig'].append(cs_Strentry(lf_settings, 1, 2, '87440', entry_conf={'width' : '6'}))
+    cs_label(lf_settings, 2, 0, 'ROI betatron amplitude', grid_conf={'columnspan' : '3', 'sticky' : 'W'})
+    configs['roidamp'].append(cs_Strentry(lf_settings, 3, 0, '23', entry_conf={'width' : '6'}))
+    cs_label(lf_settings, 3, 1, '-')
+    configs['roidamp'].append(cs_Strentry(lf_settings, 3, 2, '6000', entry_conf={'width' : '6'}))
 
     results = {}
-    cs_label(lf_results, 0, 0, 'Damping Time / (ms)', grid_conf={'sticky' : 'W'})
-    results['tau'] = cs_label(lf_results, 1, 0, 'nan', label_conf={'fg' : 'green'})[0]
+    cs_label(lf_results, 0, 0, 'Initial Amplitude',
+             grid_conf={'sticky' : 'W'})
+             
+    cs_label(lf_results, 0, 0, 'Damping Time',
+             grid_conf={'sticky' : 'W'})
+    results['tau'] = cs_label(lf_results, 1, 0, 'nan',
+                              label_conf={'fg' : 'green'},
+                              grid_conf={'sticky' : 'W'})[0]
 
-    cs_label(lf_results, 2, 0, 'Tune Shift With Amplitude / (Hz/mm'+u'\u00B2'+')', grid_conf={'sticky' : 'W'})
-    results['tswa'] = cs_label(lf_results, 3, 0, 'nan', label_conf={'fg' : 'blue'})[0]
+    cs_label(lf_results, 2, 0, 'Tune Shift With Amplitude',
+             grid_conf={'sticky' : 'W'})
+    results['tswa'] = cs_label(lf_results, 3, 0, 'nan',
+                               label_conf={'fg' : 'blue'},
+                               grid_conf={'sticky' : 'W'})[0]
 
-    cs_label(lf_results, 4, 0, 'Measurement Nr.')
-    results['pnt'] = cs_label(lf_results, 5, 0, 'nan')[0]
+    cs_label(lf_results, 4, 0, 'Measurement Nr.',
+             grid_conf={'sticky' : 'W'})
+    results['pnt'], lab = cs_label(lf_results, 5, 0, 'nan',
+                              grid_conf={'sticky' : 'W'})
+    lab.bind("<Button-2>", lambda event: print('aha'))
 
 
     epics = {}
-    cs_label(lf_epics, 0, 0, 'Write')
-    epics['write'] = cs_checkbox(lf_epics, 0, 1, 'Write', False)
-    epics['tau'] = cs_Strentry(lf_epics, 1, 0, 'FKC00V', columnspan=2)
-    epics['tswa'] = cs_Strentry(lf_epics, 3, 0, 'FKC01V', columnspan=2)
-    epics['pnt'] = cs_Strentry(lf_epics, 5, 0, 'FKC02V', columnspan=2)
-
-    runthread(tswaloop, (figs[0], axes, lines, configs, results, epics))
-
-    mainloop()
+    cs_label(lf_epics, 0, 1, 'Write')
+    
+    epics['write_tau'] = cs_checkbox(lf_epics, 1, 1, '', False)
+    epics['tau'] = cs_Strentry(lf_epics, 1, 0, 'FKC00V',
+                               entry_conf={'width' : '8'})
+    cs_label(lf_epics, 2, 0, '')
+    epics['write_tswa'] = cs_checkbox(lf_epics, 3, 1, '', False)
+    epics['tswa'] = cs_Strentry(lf_epics, 3, 0, 'FKC01V',
+                                entry_conf={'width' : '8'})
+    cs_label(lf_epics, 4, 0, '')
+    epics['write_pnt'] = cs_checkbox(lf_epics, 5, 1, '', False)
+    epics['pnt'] = cs_Strentry(lf_epics, 5, 0, 'FKC02V',
+                               entry_conf={'width' : '8'})
+    
+    # take care of threadsafe quit
+    stop_threads = Event()
+    def quitgui():
+        if askokcancel("Quit", "Do you want to quit?"):
+            stop_threads.set()
+            t_run.join(timeout=0)
+            sleep(1)
+            root.destroy()
+    root.protocol("WM_DELETE_WINDOW", quitgui)
+    
+    # start actual program in thread
+    t_run = runthread(tswaloop, (stop_threads, figs[0], axes, lines, configs, results, epics))
+    
+    root.mainloop()
