@@ -1,6 +1,5 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
-# ssh-keygen -t rsa -b 4096 -C "your_email@example.com"
 from __future__ import print_function, division
 try:
     from Tkinter import Tk, StringVar, N, E, S, W, LabelFrame, BOTH
@@ -173,7 +172,7 @@ def tswaloop(stop_threads, fig, axes, lines, configs, results, epics):
     fs = 1.2495*1e6           # sampling frequency in Hz
     dt = 1/fs
 
-    with open('calib_InterpolatedUnivariateSpline.pkl', 'rb') as fh:
+    with open(u'calib_InterpolatedUnivariateSpline.pkl', 'rb') as fh:
         calib = pickle.load(fh)
 
 #    prepare data array
@@ -322,11 +321,6 @@ if __name__ == '__main__':
     rcParams.update(params)
     figs, axes, lines = initfigs([lf_plots])
 
-    q = Queue()
-    strvar_tswa = StringVar()
-    update_strvar_tswa = lambda event: strvar_tswa.set(q.get())
-    root.bind('<<update_strvar_tswa>>', update_strvar_tswa)
-
     configs = {}
     configs['roisig'] = []
     configs['roidamp'] = []
@@ -382,6 +376,12 @@ if __name__ == '__main__':
     epics['write_tswa'] = cs_checkbox(lf_epics, 5, 1, '', False)
     epics['tswa'] = cs_Strentry(lf_epics, 5, 0, 'FKC02V',
                                entry_conf={'width' : '8'})
+                               
+    # define threadsafe event handling functions
+    q = Queue()
+    strvar_tswa = StringVar()
+    update_strvar_tswa = lambda event: strvar_tswa.set(q.get())
+    root.bind('<<update_strvar_tswa>>', update_strvar_tswa)                               
 
     # take care of threadsafe quit
     stop_threads = Event()
