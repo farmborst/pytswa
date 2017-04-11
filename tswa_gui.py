@@ -6,12 +6,14 @@ try:
     from ttk import Frame
     from tkMessageBox import showerror, askokcancel
     import cPickle as pickle
+    pickle_opts = {}
     from Queue import Queue
 except ImportError:
     from tkinter import Tk, StringVar, N, E, S, W, LabelFrame, BOTH
     from tkinter.ttk import Frame
     from tkinter.messagebox import showerror, askokcancel
     import pickle
+    pickle_opts = {'encoding': 'latin1'}
     from queue import Queue
 from epics import caget, caput
 from time import sleep
@@ -98,19 +100,11 @@ def tswa(lines, counts, bunchcurrents, roisig, roidamp,
     pts_roi = len(fd) - pts_lft - pts_rgt
     frequencyfilter = concatenate((zeros(pts_lft), hanning(pts_roi), zeros(pts_rgt+N/2)))
 
-    # predefine lists
-    fftx = empty(N, dtype=complex128)
-    fftx_filtered = empty(N, dtype=complex128)
-    analytic_signal = empty(N, dtype=complex128)
-    amplitude_envelope = empty(N-1)
-    instantaneous_phase = empty(N)
-    instantaneous_frequency = empty(N-1)
-
     # initialise pyfftw for both signals
     myfftw, myifftw = init_pyfftw(bbfbpos, wis=wisdom)
 
     # calculate fft of signal
-    fftx[:] = myfftw(bbfbpos)
+    fftx = myfftw(bbfbpos)
 
     # clip negative frequencies
     fftx_clipped = fftx.copy()
@@ -120,19 +114,17 @@ def tswa(lines, counts, bunchcurrents, roisig, roidamp,
     fftx_clipped[1:N/2] *= 2
 
     # apply frequency filter
-    fftx_filtered[:] = fftx_clipped*frequencyfilter
+    fftx_filtered = fftx_clipped*frequencyfilter
 
     # calculate inverse fft (analytical signal) of filtered and positive frequency only fft
-    analytic_signal[:] = myifftw(fftx_filtered[:])
-    amplitude_envelope[:] = npabs(analytic_signal[:])[:-1]
-    instantaneous_phase[:] = unwrap(angle(analytic_signal[:]))
-    instantaneous_frequency[:] = diff(instantaneous_phase[:]) / (2*pi) * fs
-
-    # Damping time
     beg, end = roidamp
     t2 = linspace(0, t[-1], N-1)[beg:end]
-    amplit = amplitude_envelope[beg:end]
-    signal = instantaneous_frequency[beg:end]/1e3
+    analytic_signal = myifftw(fftx_filtered)
+    amplitude_envelope = npabs(analytic_signal)[:-1][beg:end]
+    instantaneous_phase = unwrap(angle(analytic_signal))
+    instantaneous_frequency = (diff(instantaneous_phase) / (2*pi) * fs /1e3)[beg:end]
+
+    # Damping time
     '''
     ln[A*e^(d*t)] = ln(A) + d*t
     from linear fit: y = m*t + c we gain:
@@ -140,33 +132,34 @@ def tswa(lines, counts, bunchcurrents, roisig, roidamp,
                  d = m
     '''
     M = vstack([t2, ones(len(t2))]).T
-    tau_inverse, const = linalg.lstsq(M, log(amplit))[0]
+    tau_inverse, const = linalg.lstsq(M, log(amplitude_envelope))[0]
     tau_coherent = -1/tau_inverse
     initialamp = exp(const)
     fdamp = initialamp*exp(-t2/tau_coherent)
     fdamp2 = fdamp**2
 
     # Instantaneous frequency
-    instfreq = noisefilter(t2, signal, avgpts=30, smoothfac=40000)
+    instfreq = noisefilter(t2, instantaneous_frequency, avgpts=30,
+                           smoothfac=40000)
 
     # Amplitude dependant tune shift
     popt, pcov = polyfit(fdamp2, instfreq, fitorder, cov=True)
     errs = sqrt(diag(pcov))
     tswafit = poly1d(popt)(fdamp2)
 
-    plotdata = [turns, bbfbcntsnorm, t2, amplit, fdamp, signal, instfreq,
-                fdamp2, tswafit]
+    plotdata = [turns, bbfbcntsnorm, t2, amplitude_envelope, fdamp,
+                instantaneous_frequency, instfreq, fdamp2, tswafit]
     return plotdata, initialamp, tau_coherent, [popt[0]*1e3, errs[0]*1e3]
 
 
-def tswaloop(stop_threads, q, configs, results, epics):
+def tswaloop(stop_threads, q, configs, epics):
 
     # preload some loop independant stuff
     fs = 1.2495*1e6           # sampling frequency in Hz
     dt = 1/fs
 
-    with open(u'calib_InterpolatedUnivariateSpline.pkl', 'rb') as fh:
-        calib = pickle.load(fh)
+    with open('calib_InterpolatedUnivariateSpline.pkl', 'rb') as fh:
+        calib = pickle.load(fh, **pickle_opts)
 
     data = h5load('guitswatestfile', False)
     sig, cur = data['BBQR:X:SB:RAW'], data['TOPUPCC:rdCurCS']
@@ -174,11 +167,7 @@ def tswaloop(stop_threads, q, configs, results, epics):
 #    prepare data array
 #    data = [
 #        'BBQR:X:SB:RAW',             # bbfb sb measurement
-#        #'BBQR:Y:SB:RAW',             # bbfb sb measurement
-#        #'BBQR:Z:SB:RAW',             # bbfb sb measurement
 #        'BBQR:X:SRAM:MEAN',          # bbfb measurement
-#        #'BBQR:Y:SRAM:MEAN',          # bbfb measurement
-#        #'BBQR:Z:SRAM:MEAN',          # bbfb measurement
 #        'BPMZ1D5R:rdX',              # bbfb bpm position
 #        'BPMZ1D5R:rdY',              # bbfb bpm position
 #        'PKIK1D1R:set',              # kicker strength
@@ -205,9 +194,10 @@ def tswaloop(stop_threads, q, configs, results, epics):
         roisig = [int(x.get()) for x in configs['roisig']]
         roidamp = [int(x.get()) for x in configs['roidamp']]
 
-        plotdata, res_amp, res_tau, res_tswa = tswa(lines, sig, cur, roisig,
-                                                    roidamp, fs, dt, calib)
-
+        plotdata, res_amp, res_tau, res_tswa  = tswa(lines, sig, cur, roisig,
+                                                     roidamp, fs, dt, calib)
+        
+        resultsdata = [res_amp, res_tau, res_tswa, pnt]
         if epics['write_amp'].get():
             caput(epics['amp'].get(), res_amp)
         if epics['write_tau'].get():
@@ -217,15 +207,11 @@ def tswaloop(stop_threads, q, configs, results, epics):
 
         q['update_plots'].put(plotdata)
         root.event_generate('<<update_plots>>', when='tail')
-
-        results['amp'].set('{:.2f} mm'.format(res_amp))
-        results['tau'].set('{:.2f} ms'.format(res_tau))
-        results['tswa'].set(('{0:.2f} ' + u'\u00B1' + ' {1:.2f} Hz/mm' + u'\u00B2').format(res_tswa[0], res_tswa[1]))
-        results['pnt'].set(pnt)
-        # q.put(tunstr)
-        # root.event_generate('<<update_tunstrvar>>', when='tail')
-        # sleep(.1)
+        q['update_results'].put(resultsdata)
+        root.event_generate('<<update_results>>', when='tail')
+        sleep(.01)
     print('goodbye!')
+    return
 
 
 def runthread(fun, argstuple):
@@ -240,7 +226,6 @@ def runthread(fun, argstuple):
 
 def initfigs(tabs):
     close('all')
-    figs = []
     for tab in tabs:
         # destroy all widgets in fram/tab and close all figures
         for widget in tab.winfo_children():
@@ -368,7 +353,7 @@ if __name__ == '__main__':
     epics['tswa'] = cs_Strentry(lf_epics, 5, 0, 'FKC02V',
                                entry_conf={'width' : '8'})
 
-    # define threadsafe event handling functions
+    # define threadsafe event handling functions that get required data from q
     q = {}
     q['update_plots'] = Queue()
     def update_plots(event):
@@ -391,7 +376,19 @@ if __name__ == '__main__':
             ax.autoscale_view(tight=True, scalex=True, scaley=True)
 
         fig.canvas.draw()
+        return
     root.bind('<<update_plots>>', update_plots)
+    
+    q['update_results'] = Queue()
+    def update_results(event):
+        resultsdata = q['update_results'].get()
+        [res_amp, res_tau, res_tswa, pnt] = resultsdata
+        results['amp'].set('{:.2f} mm'.format(res_amp))
+        results['tau'].set('{:.2f} ms'.format(res_tau))
+        results['tswa'].set(('{0:.2f} ' + u'\u00B1' + ' {1:.2f} Hz/mm' + u'\u00B2').format(res_tswa[0], res_tswa[1]))
+        results['pnt'].set(pnt)
+        return
+    root.bind('<<update_results>>', update_results)
 
     # take care of threadsafe quit
     stop_threads = Event()
@@ -400,9 +397,9 @@ if __name__ == '__main__':
             stop_threads.set()
             sleep(1)
             root.destroy()
+            root.quit()
     root.protocol("WM_DELETE_WINDOW", quitgui)
 
     # start actual program in thread
-    t_run = runthread(tswaloop, (stop_threads, q, configs, results, epics))
-
+    t_run = runthread(tswaloop, (stop_threads, q, configs, epics))
     root.mainloop()
