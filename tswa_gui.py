@@ -152,21 +152,14 @@ def tswa(lines, counts, bunchcurrents, roisig, roidamp,
     # Amplitude dependant tune shift
     popt, pcov = polyfit(fdamp2, instfreq, fitorder, cov=True)
     errs = sqrt(diag(pcov))
+    tswafit = poly1d(popt)(fdamp2)
 
-    lines[0][0].set_data(turns, bbfbcntsnorm)
-
-    lines[1][0].set_data(t2, amplit)
-    lines[1][1].set_data(t2, fdamp)
-
-    lines[2][0].set_data(t2, signal)
-    lines[2][1].set_data(t2, instfreq)
-
-    lines[3][0].set_data(fdamp2, instfreq)
-    lines[3][1].set_data(fdamp2, poly1d(popt)(fdamp2))
-    return initialamp, tau_coherent, [popt[0]*1e3, errs[0]*1e3]
+    plotdata = [turns, bbfbcntsnorm, t2, amplit, fdamp, signal, instfreq,
+                fdamp2, tswafit]
+    return plotdata, initialamp, tau_coherent, [popt[0]*1e3, errs[0]*1e3]
 
 
-def tswaloop(stop_threads, fig, axes, lines, configs, results, epics):
+def tswaloop(stop_threads, q, configs, results, epics):
 
     # preload some loop independant stuff
     fs = 1.2495*1e6           # sampling frequency in Hz
@@ -174,6 +167,9 @@ def tswaloop(stop_threads, fig, axes, lines, configs, results, epics):
 
     with open(u'calib_InterpolatedUnivariateSpline.pkl', 'rb') as fh:
         calib = pickle.load(fh)
+
+    data = h5load('guitswatestfile', False)
+    sig, cur = data['BBQR:X:SB:RAW'], data['TOPUPCC:rdCurCS']
 
 #    prepare data array
 #    data = [
@@ -201,19 +197,16 @@ def tswaloop(stop_threads, fig, axes, lines, configs, results, epics):
 #            data['timestamp'].append(str(datetime.now()))
 #            for entry in data:
 #                data[entry].append(caget(entry))
-        try:
-            sig = caget('BBQR:X:SB:RAW')
-            cur = caget('TOPUPCC:rdCurCS')
-        except:
-            showerror(title='epics error', message='error reading epics')
+#        try:
+#            sig = caget('BBQR:X:SB:RAW')
+#            cur = caget('TOPUPCC:rdCurCS')
+#        except:
+#            showerror(title='epics error', message='error reading epics')
         roisig = [int(x.get()) for x in configs['roisig']]
         roidamp = [int(x.get()) for x in configs['roidamp']]
 
-        data = h5load('guitswatestfile', False)
-        sig, cur = data['BBQR:X:SB:RAW'], data['TOPUPCC:rdCurCS']
-
-        res_amp, res_tau, res_tswa = tswa(lines, sig, cur, roisig, roidamp,
-                                          fs, dt, calib)
+        plotdata, res_amp, res_tau, res_tswa = tswa(lines, sig, cur, roisig,
+                                                    roidamp, fs, dt, calib)
 
         if epics['write_amp'].get():
             caput(epics['amp'].get(), res_amp)
@@ -222,10 +215,9 @@ def tswaloop(stop_threads, fig, axes, lines, configs, results, epics):
         if epics['write_tswa'].get():
             caput(epics['tswa'].get(), res_tswa[0])
 
-        for ax in axes:
-            ax.relim()
-            ax.autoscale_view(tight=True, scalex=True, scaley=True)
-        fig.canvas.draw()
+        q['update_plots'].put(plotdata)
+        root.event_generate('<<update_plots>>', when='tail')
+
         results['amp'].set('{:.2f} mm'.format(res_amp))
         results['tau'].set('{:.2f} ms'.format(res_tau))
         results['tswa'].set(('{0:.2f} ' + u'\u00B1' + ' {1:.2f} Hz/mm' + u'\u00B2').format(res_tswa[0], res_tswa[1]))
@@ -274,11 +266,10 @@ def initfigs(tabs):
             ax.set_ylabel(ylab)
             ax.grid(True)
         canvas = FigureCanvasTkAgg(fig, master=tab)
-        figs.append(fig)
         toolbar = NavigationToolbar2TkAgg(canvas, tab)
         canvas.get_tk_widget().pack()
         toolbar.pack()
-    return figs, axes, lines
+    return fig, axes, lines
 
 
 if __name__ == '__main__':
@@ -319,7 +310,7 @@ if __name__ == '__main__':
               'xtick.labelsize': 10,
               'ytick.labelsize': 10}
     rcParams.update(params)
-    figs, axes, lines = initfigs([lf_plots])
+    fig, axes, lines = initfigs([lf_plots])
 
     configs = {}
     configs['roisig'] = []
@@ -376,24 +367,42 @@ if __name__ == '__main__':
     epics['write_tswa'] = cs_checkbox(lf_epics, 5, 1, '', False)
     epics['tswa'] = cs_Strentry(lf_epics, 5, 0, 'FKC02V',
                                entry_conf={'width' : '8'})
-                               
+
     # define threadsafe event handling functions
-    q = Queue()
-    strvar_tswa = StringVar()
-    update_strvar_tswa = lambda event: strvar_tswa.set(q.get())
-    root.bind('<<update_strvar_tswa>>', update_strvar_tswa)                               
+    q = {}
+    q['update_plots'] = Queue()
+    def update_plots(event):
+        plotdata = q['update_plots'].get()
+        [turns, bbfbcntsnorm, t2, amplit, fdamp, signal, instfreq, fdamp2,
+         tswafit] = plotdata
+        lines[0][0].set_data(turns, bbfbcntsnorm)
+
+        lines[1][0].set_data(t2, amplit)
+        lines[1][1].set_data(t2, fdamp)
+
+        lines[2][0].set_data(t2, signal)
+        lines[2][1].set_data(t2, instfreq)
+
+        lines[3][0].set_data(fdamp2, instfreq)
+        lines[3][1].set_data(fdamp2, tswafit)
+
+        for ax in axes:
+            ax.relim()
+            ax.autoscale_view(tight=True, scalex=True, scaley=True)
+
+        fig.canvas.draw()
+    root.bind('<<update_plots>>', update_plots)
 
     # take care of threadsafe quit
     stop_threads = Event()
     def quitgui():
         if askokcancel("Quit", "Do you want to quit?"):
             stop_threads.set()
-            t_run.join(timeout=0)
             sleep(1)
             root.destroy()
     root.protocol("WM_DELETE_WINDOW", quitgui)
 
     # start actual program in thread
-    t_run = runthread(tswaloop, (stop_threads, figs[0], axes, lines, configs, results, epics))
+    t_run = runthread(tswaloop, (stop_threads, q, configs, results, epics))
 
     root.mainloop()
