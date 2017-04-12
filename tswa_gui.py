@@ -2,38 +2,39 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function, division
 try:
-    from Tkinter import Tk, StringVar, N, E, S, W, LabelFrame, BOTH
+    from Tkinter import Tk, Toplevel, StringVar, N, E, S, W, LabelFrame, BOTH
     from ttk import Frame
     from tkMessageBox import showerror, askokcancel
     import cPickle as pickle
     pickle_opts = {}
     from Queue import Queue
 except ImportError:
-    from tkinter import Tk, StringVar, N, E, S, W, LabelFrame, BOTH
+    from tkinter import Tk, Toplevel, StringVar, N, E, S, W, LabelFrame, BOTH
     from tkinter.ttk import Frame
     from tkinter.messagebox import showerror, askokcancel
     import pickle
     pickle_opts = {'encoding': 'latin1'}
     from queue import Queue
 from epics import caget, caput
-from time import sleep
 from datetime import datetime
 from threading import Thread, Event
 
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.patches import Rectangle
-from matplotlib.pyplot import figure, rcdefaults, rcParams, close
+from matplotlib.pyplot import Figure, rcdefaults, rcParams, close
 from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
                                                NavigationToolbar2TkAgg)
 from numpy import (linspace, arange, concatenate, pi, complex128, zeros,
                    empty, angle, unwrap, diff, abs as npabs, ones, vstack, exp,
                    log, linalg, cos, polyfit, poly1d, sqrt, diag)
 import pyfftw
-from layout import (cs_label, cs_Strentry, cs_checkbox)
+from layout import (cs_label, cs_Strentry, cs_checkbox, cp_label)
 from hdf5 import h5load
 from scipy.interpolate import InterpolatedUnivariateSpline
+from scipy.optimize import curve_fit
 from pandas import rolling_mean
+from subprocess import Popen, PIPE
 
 
 effort = ['FFTW_ESTIMATE', 'FFTW_MEASURE', 'FFTW_PATIENT', 'FFTW_EXHAUSTIVE']
@@ -75,16 +76,12 @@ def tswa(lines, counts, bunchcurrents, roisig, roidamp,
     beg, end = roisig
     counts = counts[beg:end]
 
-    N = len(counts)           # number of points taken per measurement
+    N = len(counts)             # number of points taken per measurement
     turns = arange(N)
-    t = turns*dt*1e3  # time in ms
+    t = turns*dt*1e3            # time in ms
 
     bbfbcntsnorm = (counts.T/bunchcurrents).T
-
     bbfbpos = calib(bbfbcntsnorm)
-
-    # Turn on the cache for optimum pyfftw performance
-    pyfftw.interfaces.cache.enable()
 
     init_pyfftw(bbfbpos, effort='FFTW_MEASURE')
     wisdom = pyfftw.export_wisdom()
@@ -121,21 +118,16 @@ def tswa(lines, counts, bunchcurrents, roisig, roidamp,
     t2 = linspace(0, t[-1], N-1)[beg:end]
     analytic_signal = myifftw(fftx_filtered)
     amplitude_envelope = npabs(analytic_signal)[:-1][beg:end]
-    instantaneous_phase = unwrap(angle(analytic_signal))
+    instantaneous_phase = (unwrap(angle(analytic_signal)))
     instantaneous_frequency = (diff(instantaneous_phase) / (2*pi) * fs /1e3)[beg:end]
 
     # Damping time
-    '''
-    ln[A*e^(d*t)] = ln(A) + d*t
-    from linear fit: y = m*t + c we gain:
-                 A = e^c
-                 d = m
-    '''
-    M = vstack([t2, ones(len(t2))]).T
-    tau_inverse, const = linalg.lstsq(M, log(amplitude_envelope))[0]
-    tau_coherent = -1/tau_inverse
-    initialamp = exp(const)
-    fdamp = initialamp*exp(-t2/tau_coherent)
+    expfun = lambda t, amp, tau: amp*exp(-t/tau)
+    popt, pcov = curve_fit(expfun, t2, amplitude_envelope)
+    errs = sqrt(diag(pcov))
+    initialamp = [popt[0], errs[0]]
+    tau = [popt[1], errs[1]]
+    fdamp = expfun(t2, *popt)
     fdamp2 = fdamp**2
 
     # Instantaneous frequency
@@ -149,7 +141,7 @@ def tswa(lines, counts, bunchcurrents, roisig, roidamp,
 
     plotdata = [turns, bbfbcntsnorm, t2, amplitude_envelope, fdamp,
                 instantaneous_frequency, instfreq, fdamp2, tswafit]
-    return plotdata, initialamp, tau_coherent, [popt[0]*1e3, errs[0]*1e3]
+    return plotdata, initialamp, tau, [popt[0]*1e3, errs[0]*1e3]
 
 
 def tswaloop(stop_threads, q, configs, epics):
@@ -157,6 +149,9 @@ def tswaloop(stop_threads, q, configs, epics):
     # preload some loop independant stuff
     fs = 1.2495*1e6           # sampling frequency in Hz
     dt = 1/fs
+    
+    # Turn on the cache for optimum pyfftw performance
+    pyfftw.interfaces.cache.enable()
 
     with open('calib_InterpolatedUnivariateSpline.pkl', 'rb') as fh:
         calib = pickle.load(fh, **pickle_opts)
@@ -199,17 +194,16 @@ def tswaloop(stop_threads, q, configs, epics):
         
         resultsdata = [res_amp, res_tau, res_tswa, pnt]
         if epics['write_amp'].get():
-            caput(epics['amp'].get(), res_amp)
+            caput(epics['amp'], res_amp[0])
         if epics['write_tau'].get():
-            caput(epics['tau'].get(), res_tau)
+            caput(epics['tau'], res_tau[0])
         if epics['write_tswa'].get():
-            caput(epics['tswa'].get(), res_tswa[0])
+            caput(epics['tswa'], res_tswa[0])
 
         q['update_plots'].put(plotdata)
         root.event_generate('<<update_plots>>', when='tail')
         q['update_results'].put(resultsdata)
         root.event_generate('<<update_results>>', when='tail')
-        sleep(.01)
     print('goodbye!')
     return
 
@@ -224,36 +218,36 @@ def runthread(fun, argstuple):
     return t_run
 
 
-def initfigs(tabs):
+def initfigs(labelframe):
     close('all')
-    for tab in tabs:
-        # destroy all widgets in fram/tab and close all figures
-        for widget in tab.winfo_children():
-            widget.destroy()
-        fig = figure()
-        axes = [fig.add_subplot(2, 2, i+1) for i in range(4)]
-        xlabs = ['turns',
-                 'time / (ms)',
-                 'time / (ms))',
-                 r'square amplitude / $(mm^2)$']
-        ylabs = ['ADC counts',
-                 'betatron amplitude / (mm)',
-                 'frequency / (kHz)',
-                 'frequency / (kHz)']
-        stylesets = [['-b'],
-                     ['-b', '-r'],
-                     ['-b', '-r'],
-                     ['-b', '-r']]
-        lines = []
-        for ax, xlab, ylab, styles in zip(axes, xlabs, ylabs, stylesets):
-            lines.append([ax.plot([], [], style)[0] for style in styles])
-            ax.set_xlabel(xlab)
-            ax.set_ylabel(ylab)
-            ax.grid(True)
-        canvas = FigureCanvasTkAgg(fig, master=tab)
-        toolbar = NavigationToolbar2TkAgg(canvas, tab)
-        canvas.get_tk_widget().pack()
-        toolbar.pack()
+    # destroy all widgets in fram/tab and close all figures
+    for widget in labelframe.winfo_children():
+        widget.destroy()
+    fig = Figure(frameon=False)
+    axes = [fig.add_subplot(2, 2, i+1) for i in range(4)]
+    xlabs = ['turns',
+             'time / (ms)',
+             'time / (ms))',
+             r'square amplitude / $(mm^2)$']
+    ylabs = ['ADC counts',
+             'betatron amplitude / (mm)',
+             'frequency / (kHz)',
+             'frequency / (kHz)']
+    stylesets = [['-b'],
+                 ['-b', '-r'],
+                 ['-b', '-r'],
+                 ['-b', '-r']]
+    lines = []
+    for ax, xlab, ylab, styles in zip(axes, xlabs, ylabs, stylesets):
+        lines.append([ax.plot([], [], style)[0] for style in styles])
+        ax.set_xlabel(xlab)
+        ax.set_ylabel(ylab)
+        ax.grid(True)
+    canvas = FigureCanvasTkAgg(fig, master=labelframe)
+    canvas._tkcanvas.config(highlightthickness=0)
+    toolbar = NavigationToolbar2TkAgg(canvas, labelframe)
+    canvas.get_tk_widget().pack()
+    toolbar.pack()
     return fig, axes, lines
 
 
@@ -263,11 +257,9 @@ if __name__ == '__main__':
     frame = Frame(root)
     frame.pack(fill=BOTH, expand=True)
     lf_settings = LabelFrame(frame, text="Settings", padx=5, pady=5)
-    lf_settings.grid(row=0, column=0, columnspan=2, sticky=W+E+N+S, padx=10, pady=10)
+    lf_settings.grid(row=0, column=0, sticky=W+E+N+S, padx=10, pady=10)
     lf_results = LabelFrame(frame, text="Results", padx=5, pady=5)
     lf_results.grid(row=1, column=0, sticky=W+E+N+S, padx=10, pady=10)
-    lf_epics = LabelFrame(frame, text="EPICS", padx=5, pady=5)
-    lf_epics.grid(row=1, column=1, sticky=W+E+N+S, padx=10, pady=10)
     lf_plots = LabelFrame(frame, text="Matplotlib", padx=5, pady=5)
     lf_plots.grid(row=0, column=2, rowspan=2, sticky=W+E+N+S, padx=10, pady=10)
 
@@ -295,7 +287,7 @@ if __name__ == '__main__':
               'xtick.labelsize': 10,
               'ytick.labelsize': 10}
     rcParams.update(params)
-    fig, axes, lines = initfigs([lf_plots])
+    fig, axes, lines = initfigs(lf_plots)
 
     configs = {}
     configs['roisig'] = []
@@ -309,49 +301,65 @@ if __name__ == '__main__':
     cs_label(lf_settings, 3, 1, '-')
     configs['roidamp'].append(cs_Strentry(lf_settings, 3, 2, '6000', entry_conf={'width' : '6'}))
 
-    results = {}
-    cs_label(lf_results, 0, 0, 'Initial Amplitude',
-             grid_conf={'sticky' : 'W'})
+    results, lab = {}, {}
+    cs_label(lf_results, 0, 0, 'Initial amplitude', grid_conf={'sticky' : 'W'})
+    results['amp'], lab['amp'] = cs_label(lf_results, 1, 0, 'nan',
+                                          label_conf={'fg' : 'red'},
+                                          grid_conf={'sticky' : 'W'})
 
-    cs_label(lf_results, 0, 0, 'Initial amplitude',
-             grid_conf={'sticky' : 'W'})
-    results['amp'] = cs_label(lf_results, 1, 0, 'nan',
-                              label_conf={'fg' : 'red'},
+    cs_label(lf_results, 2, 0, 'Damping time', grid_conf={'sticky' : 'W'})
+    results['tau'], lab['tau'] = cs_label(lf_results, 3, 0, 'nan',
+                                          label_conf={'fg' : 'blue'},
+                                          grid_conf={'sticky' : 'W'})
+
+    cs_label(lf_results, 4, 0, 'Tune Shift With Amplitude', grid_conf={'sticky' : 'W'})
+    results['tswa'], lab['tswa'] = cs_label(lf_results, 5, 0, 'nan',
+                                            label_conf={'fg' : 'green'},
+                                            grid_conf={'sticky' : 'W'})
+
+    cs_label(lf_results, 6, 0, 'Measurement Nr.', grid_conf={'sticky' : 'W'})
+    results['pnt'] = cs_label(lf_results, 7, 0, 'nan',
                               grid_conf={'sticky' : 'W'})[0]
-
-    cs_label(lf_results, 2, 0, 'Damping Time',
-             grid_conf={'sticky' : 'W'})
-    results['tau'] = cs_label(lf_results, 3, 0, 'nan',
-                              label_conf={'fg' : 'blue'},
-                              grid_conf={'sticky' : 'W'})[0]
-
-    cs_label(lf_results, 4, 0, 'Tune Shift With Amplitude',
-             grid_conf={'sticky' : 'W'})
-    results['tswa'] = cs_label(lf_results, 5, 0, 'nan',
-                               label_conf={'fg' : 'green'},
-                               grid_conf={'sticky' : 'W'})[0]
-
-    cs_label(lf_results, 6, 0, 'Measurement Nr.',
-             grid_conf={'sticky' : 'W'})
-    results['pnt'], lab = cs_label(lf_results, 7, 0, 'nan',
-                              grid_conf={'sticky' : 'W'})
-    lab.bind("<Button-2>", lambda event: print('aha'))
-
 
     epics = {}
-    cs_label(lf_epics, 0, 1, 'Write')
+    cs_label(lf_results, 0, 1, 'Write')
+    epics['write_amp'] = cs_checkbox(lf_results, 1, 1, '', False)
+    epics['amp'] = 'FKC00V'
+    epics['write_tau'] = cs_checkbox(lf_results, 3, 1, '', False)
+    epics['tau'] = 'FKC01V'
+    epics['write_tswa'] = cs_checkbox(lf_results, 5, 1, '', False)
+    epics['tswa'] = 'FKC02V'
 
-    epics['write_amp'] = cs_checkbox(lf_epics, 1, 1, '', False)
-    epics['amp'] = cs_Strentry(lf_epics, 1, 0, 'FKC00V',
-                               entry_conf={'width' : '8'})
-    cs_label(lf_epics, 2, 0, '')
-    epics['write_tau'] = cs_checkbox(lf_epics, 3, 1, '', False)
-    epics['tau'] = cs_Strentry(lf_epics, 3, 0, 'FKC01V',
-                                entry_conf={'width' : '8'})
-    cs_label(lf_epics, 4, 0, '')
-    epics['write_tswa'] = cs_checkbox(lf_epics, 5, 1, '', False)
-    epics['tswa'] = cs_Strentry(lf_epics, 5, 0, 'FKC02V',
-                               entry_conf={'width' : '8'})
+    popup = Toplevel(bg='')
+    popup.overrideredirect(True)
+    popup.withdraw()
+    popupstr, popuplab = cp_label(popup, '', 
+                                  label_conf={'bg':'black', 'fg':'green',
+                                              'font':'Mono 15'},
+                                  pack_conf={'side':'right'})
+    
+    def b2click(event, text):
+        # get epics var name
+        text = epics[text]
+
+        # create popup displaying epics name
+        popupstr.set(text)
+        popup.update()
+        w, h = popuplab.winfo_width(), popuplab.winfo_height()
+        pos = root.winfo_pointerx(), root.winfo_pointery()
+        popup.wm_geometry('{:d}x{:d}+{:d}+{:d}'.format(w + 15, h, *pos))
+        popup.deiconify()
+        
+        # copy epics variable to xsel
+        p = Popen(['xsel', '-pi'], stdin=PIPE)
+        p.communicate(input=text)
+        
+        # copy epics name to clipboard
+        root.clipboard_clear()
+        root.clipboard_append(text)
+        return
+    [lab[l].bind("<Button-2>", lambda event, text=l: b2click(event, text)) for l in lab]
+    [lab[l].bind("<ButtonRelease-2>", lambda event: popup.withdraw()) for l in lab]
 
     # define threadsafe event handling functions that get required data from q
     q = {}
@@ -383,9 +391,9 @@ if __name__ == '__main__':
     def update_results(event):
         resultsdata = q['update_results'].get()
         [res_amp, res_tau, res_tswa, pnt] = resultsdata
-        results['amp'].set('{:.2f} mm'.format(res_amp))
-        results['tau'].set('{:.2f} ms'.format(res_tau))
-        results['tswa'].set(('{0:.2f} ' + u'\u00B1' + ' {1:.2f} Hz/mm' + u'\u00B2').format(res_tswa[0], res_tswa[1]))
+        results['amp'].set(('{0:.2f} ' + u'\u00B1' + ' {1:.2f} mm').format(*res_amp))
+        results['tau'].set(('{0:.2f} ' + u'\u00B1' + ' {1:.2f} ms').format(*res_tau))
+        results['tswa'].set(('{0:.2f} ' + u'\u00B1' + ' {1:.2f} Hz/mm' + u'\u00B2').format(*res_tswa))
         results['pnt'].set(pnt)
         return
     root.bind('<<update_results>>', update_results)
@@ -395,8 +403,7 @@ if __name__ == '__main__':
     def quitgui():
         if askokcancel("Quit", "Do you want to quit?"):
             stop_threads.set()
-            sleep(1)
-            root.destroy()
+            root.after(2000, root.destroy())
             root.quit()
     root.protocol("WM_DELETE_WINDOW", quitgui)
 

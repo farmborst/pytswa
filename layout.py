@@ -30,6 +30,15 @@ def cs_label(root, r, c, name, label_conf={}, grid_conf={}):
     return labelstr, label
 
 
+# create, position and set tkinter label
+def cp_label(root, name, label_conf={}, pack_conf={}):
+    labelstr = StringVar()
+    labelstr.set(name)
+    label = Label(root, textvariable=labelstr, **label_conf)
+    label.pack(**pack_conf)
+    return labelstr, label
+
+
 # create, position and set IntVar label
 def cs_Intentry(root, r, c, value, entry_conf={}, grid_conf={}):
     entryint = IntVar()
