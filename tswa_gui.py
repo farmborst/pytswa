@@ -17,7 +17,7 @@ except ImportError:
     from queue import Queue
 from epics import caget, caput
 from datetime import datetime
-from threading import Thread, Event
+from threading import Thread
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -144,7 +144,7 @@ def tswa(lines, counts, bunchcurrents, roisig, roidamp,
     return plotdata, initialamp, tau, [popt[0]*1e3, errs[0]*1e3]
 
 
-def tswaloop(stop_threads, q, configs, epics):
+def tswaloop(q, configs, epics):
 
     # preload some loop independant stuff
     fs = 1.2495*1e6           # sampling frequency in Hz
@@ -175,7 +175,7 @@ def tswaloop(stop_threads, q, configs, epics):
 #    data = dict(zip(data, [[] for i in range(len(data))]))
 #    data['timestamp'] = []
     pnt = 0
-    while not stop_threads.is_set():
+    while q['run']:
         pnt += 1
 #        try:
 #            data['timestamp'].append(str(datetime.now()))
@@ -345,13 +345,14 @@ if __name__ == '__main__':
         # create popup displaying epics name
         popupstr.set(text)
         popup.update()
-        w, h = popuplab.winfo_width(), popuplab.winfo_height()
-        pos = root.winfo_pointerx(), root.winfo_pointery()
-        popup.wm_geometry('{:d}x{:d}+{:d}+{:d}'.format(w + 15, h, *pos))
+        w, h = popuplab.winfo_width() + 15, popuplab.winfo_height()
+        x, y = root.winfo_pointerx(), root.winfo_pointery()
+        popup.wm_geometry('{:d}x{:d}+{:d}+{:d}'.format(w, h, x, y))
         popup.deiconify()
         
         # copy epics variable to xsel
-        p = Popen(['xsel', '-pi'], stdin=PIPE)
+        # universal_newlines -> input and output as text (not byte) strings
+        p = Popen(['xsel', '-pi'], stdin=PIPE, universal_newlines=True)
         p.communicate(input=text)
         
         # copy epics name to clipboard
@@ -363,6 +364,8 @@ if __name__ == '__main__':
 
     # define threadsafe event handling functions that get required data from q
     q = {}
+    q['run'] = Queue()
+    q['run'].put(True)
     q['update_plots'] = Queue()
     def update_plots(event):
         plotdata = q['update_plots'].get()
@@ -399,14 +402,14 @@ if __name__ == '__main__':
     root.bind('<<update_results>>', update_results)
 
     # take care of threadsafe quit
-    stop_threads = Event()
     def quitgui():
         if askokcancel("Quit", "Do you want to quit?"):
-            stop_threads.set()
-            root.after(2000, root.destroy())
+            q['run'].put(False)
+            root.after(2000)
+            root.destroy()
             root.quit()
     root.protocol("WM_DELETE_WINDOW", quitgui)
 
     # start actual program in thread
-    t_run = runthread(tswaloop, (stop_threads, q, configs, epics))
+    t_run = runthread(tswaloop, (q, configs, epics))
     root.mainloop()
