@@ -35,21 +35,17 @@ from scipy.interpolate import InterpolatedUnivariateSpline
 from scipy.optimize import curve_fit
 from pandas import rolling_mean
 from subprocess import Popen, PIPE
+simd_alignment = pyfftw.simd_alignment
 
 
 effort = ['FFTW_ESTIMATE', 'FFTW_MEASURE', 'FFTW_PATIENT', 'FFTW_EXHAUSTIVE']
-def init_pyfftw(x, effort=effort[0], wis=False):
-    N = len(x)
-    n = pyfftw.simd_alignment
-    a = pyfftw.n_byte_align_empty(int(N), n, 'complex128')
-    a[:] = x
-    if wis is not False:
-        pyfftw.import_wisdom(wis)
-        fft = pyfftw.builders.fft(a, threads=8)
-        ifft = pyfftw.builders.ifft(a, threads=8)
-    else:
-        fft = pyfftw.builders.fft(a, planner_effort=effort, threads=8)
-        ifft = pyfftw.builders.ifft(a, planner_effort=effort, threads=8)
+def init_pyfftw(N):
+    a = pyfftw.n_byte_align_empty(N, simd_alignment, 'complex128')
+    b = pyfftw.n_byte_align_empty(N, simd_alignment, 'complex128')
+    c = pyfftw.n_byte_align_empty(N, simd_alignment, 'complex128')
+    fft = pyfftw.FFTW(a, b, threads=2, effort=effort[0])
+    ifft = pyfftw.FFTW(b, c, direction='FFTW_BACKWARD', threads=2,
+                       effort=effort[0])
     return fft, ifft
 
 
@@ -71,23 +67,11 @@ def drawpatch(ax, leftx, width):
     ax.add_patch(patch)
 
 
-def tswa(lines, counts, bunchcurrents, roisig, roidamp,
-         fs, dt, calib, fitorder=1):
-    beg, end = roisig
-    counts = counts[beg:end]
-
-    N = len(counts)             # number of points taken per measurement
-    turns = arange(N)
-    t = turns*dt*1e3            # time in ms
-
+def tswa(lines, counts, bunchcurrents, t, turns, roidamp, fs, dt, calib,
+         myfftw, myifftw, fd, fitorder=1):
+    
     bbfbcntsnorm = (counts.T/bunchcurrents).T
     bbfbpos = calib(bbfbcntsnorm)
-
-    init_pyfftw(bbfbpos, effort='FFTW_MEASURE')
-    wisdom = pyfftw.export_wisdom()
-
-    # create frequency vector
-    fd = linspace(0, fs/2/1e3, N/2)
 
     # prepare frequency filter
     fcent, fsigm = 190, 50
@@ -96,9 +80,6 @@ def tswa(lines, counts, bunchcurrents, roisig, roidamp,
     pts_rgt = sum(fd > fright)
     pts_roi = len(fd) - pts_lft - pts_rgt
     frequencyfilter = concatenate((zeros(pts_lft), hanning(pts_roi), zeros(pts_rgt+N/2)))
-
-    # initialise pyfftw for both signals
-    myfftw, myifftw = init_pyfftw(bbfbpos, wis=wisdom)
 
     # calculate fft of signal
     fftx = myfftw(bbfbpos)
@@ -144,9 +125,7 @@ def tswa(lines, counts, bunchcurrents, roisig, roidamp,
     return plotdata, initialamp, tau, [popt[0]*1e3, errs[0]*1e3]
 
 
-def tswaloop(q, configs, epics):
-
-    # preload some loop independant stuff
+def inittswa(N):
     fs = 1.2495*1e6           # sampling frequency in Hz
     dt = 1/fs
     
@@ -158,6 +137,26 @@ def tswaloop(q, configs, epics):
 
     data = h5load('guitswatestfile', False)
     sig, cur = data['BBQR:X:SB:RAW'], data['TOPUPCC:rdCurCS']
+    
+    roisig = [int(x.get()) for x in configs['roisig']]
+    roidamp = [int(x.get()) for x in configs['roidamp']]
+    
+    beg, end = roisig
+    sig = sig[beg:end]
+    N = end-beg                      # number of points taken per measurement
+    turns = arange(N)
+    t = turns*dt*1e3                 # time in ms
+    fd = linspace(0, fs/2/1e3, N/2)  # create frequency vector
+
+    # initialise pyfftw for both signals
+    myfftw, myifftw = init_pyfftw(N)
+    return myfftw, myifftw, 
+    
+
+
+def tswaloop(q, configs, epics):
+
+    
 
 #    prepare data array
 #    data = [
@@ -175,6 +174,7 @@ def tswaloop(q, configs, epics):
 #    data = dict(zip(data, [[] for i in range(len(data))]))
 #    data['timestamp'] = []
     pnt = 0
+    pressed = False
     while q['run']:
         pnt += 1
 #        try:
@@ -186,11 +186,23 @@ def tswaloop(q, configs, epics):
 #            cur = caget('TOPUPCC:rdCurCS')
 #        except:
 #            showerror(title='epics error', message='error reading epics')
-        roisig = [int(x.get()) for x in configs['roisig']]
-        roidamp = [int(x.get()) for x in configs['roidamp']]
+        if pressed:
+            roisig = [int(x.get()) for x in configs['roisig']]
+            roidamp = [int(x.get()) for x in configs['roidamp']]
+            
+            beg, end = roisig
+            sig = sig[beg:end]
+            N = end-beg          # number of points taken per measurement
+            
+            turns = arange(N)
+            t = turns*dt*1e3            # time in ms
+        
+            # initialise pyfftw for both signals
+            myfftw, myifftw = init_pyfftw(N)
 
-        plotdata, res_amp, res_tau, res_tswa  = tswa(lines, sig, cur, roisig,
-                                                     roidamp, fs, dt, calib)
+        plotdata, res_amp, res_tau, res_tswa  = tswa(lines, sig, cur, t, turns,
+                                                     roidamp, fs, dt, calib,
+                                                     myfftw, myifftw, fd)
         
         resultsdata = [res_amp, res_tau, res_tswa, pnt]
         if epics['write_amp'].get():
