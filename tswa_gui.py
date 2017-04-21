@@ -27,9 +27,9 @@ from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
                                                NavigationToolbar2TkAgg)
 from numpy import (linspace, arange, concatenate, pi, complex128, zeros,
                    empty, angle, unwrap, diff, abs as npabs, ones, vstack, exp,
-                   log, linalg, cos, polyfit, poly1d, sqrt, diag)
+                   log, linalg, cos, polyfit, poly1d, sqrt, diag, save, load)
 import pyfftw
-from layout import (cs_label, cs_Strentry, cs_checkbox, cp_label)
+from layout import (cs_label, cs_Strentry, cs_checkbox, cp_label, cs_button)
 from hdf5 import h5load
 from scipy.interpolate import InterpolatedUnivariateSpline
 from scipy.optimize import curve_fit
@@ -67,10 +67,13 @@ def drawpatch(ax, leftx, width):
     ax.add_patch(patch)
 
 
-def tswa(lines, counts, bunchcurrents, t, turns, roidamp, fs, dt, calib,
-         myfftw, myifftw, fd, fitorder=1):
+def tswa(sig, cur, pars, calib, fitorder=1):
+    N, t, turns, roisig, roidamp, fs, dt, myfftw, myifftw, fd = pars
     
-    bbfbcntsnorm = (counts.T/bunchcurrents).T
+    beg, end = roisig
+    sig = sig[beg:end]
+    
+    bbfbcntsnorm = (sig.T/cur).T
     bbfbpos = calib(bbfbcntsnorm)
 
     # prepare frequency filter
@@ -125,24 +128,13 @@ def tswa(lines, counts, bunchcurrents, t, turns, roidamp, fs, dt, calib,
     return plotdata, initialamp, tau, [popt[0]*1e3, errs[0]*1e3]
 
 
-def inittswa(N):
+def inittswa():
     fs = 1.2495*1e6           # sampling frequency in Hz
     dt = 1/fs
-    
-    # Turn on the cache for optimum pyfftw performance
-    pyfftw.interfaces.cache.enable()
 
-    with open('calib_InterpolatedUnivariateSpline.pkl', 'rb') as fh:
-        calib = pickle.load(fh, **pickle_opts)
-
-    data = h5load('guitswatestfile', False)
-    sig, cur = data['BBQR:X:SB:RAW'], data['TOPUPCC:rdCurCS']
-    
     roisig = [int(x.get()) for x in configs['roisig']]
     roidamp = [int(x.get()) for x in configs['roidamp']]
-    
     beg, end = roisig
-    sig = sig[beg:end]
     N = end-beg                      # number of points taken per measurement
     turns = arange(N)
     t = turns*dt*1e3                 # time in ms
@@ -150,60 +142,52 @@ def inittswa(N):
 
     # initialise pyfftw for both signals
     myfftw, myifftw = init_pyfftw(N)
-    return myfftw, myifftw, 
+    pars = N, t, turns, roisig, roidamp, fs, dt, myfftw, myifftw, fd
+    return pars
+
+
+data = h5load('guitswatestfile', False)
+def getdata():
+    try:
+        #sig, cur = data['BBQR:X:SB:RAW'], data['TOPUPCC:rdCurCS']
+        sig, cur = caget('BBQR:X:SB:RAW'), caget('TOPUPCC:rdCurCS')
+    except:
+        showerror(title='epics error', message='error reading epics')
+    return sig, cur
     
 
 
 def tswaloop(q, configs, epics):
-
+    # Turn on the cache for optimum pyfftw performance
+    pyfftw.interfaces.cache.enable()
     
-
-#    prepare data array
-#    data = [
-#        'BBQR:X:SB:RAW',             # bbfb sb measurement
-#        'BBQR:X:SRAM:MEAN',          # bbfb measurement
-#        'BPMZ1D5R:rdX',              # bbfb bpm position
-#        'BPMZ1D5R:rdY',              # bbfb bpm position
-#        'PKIK1D1R:set',              # kicker strength
-#        'PKIK3D1R:set',              # kicker strength
-#        'CUMZR:rdCur',               # total storage ring current
-#        'TOPUPCC:rdCurCS',           # single bunch current
-#        'CUMZR:MBcurrent',           # fillpattern
-#        'MCLKHX251C:freq'            # masterclock of RF frequency
-#        ]
-#    data = dict(zip(data, [[] for i in range(len(data))]))
-#    data['timestamp'] = []
+    # Import Wisdom Files for pyFFTW
+    try:
+        pyfftw.import_wisdom(load('wisdom.npy'))
+        print('wisdom loaded from file')
+    except:
+        pass
+    
+    with open('calib_InterpolatedUnivariateSpline.pkl', 'rb') as fh:
+        calib = pickle.load(fh, **pickle_opts)
+    
+    pars = inittswa()
+    
     pnt = 0
-    pressed = False
-    while q['run']:
+    while q['run'].empty():
         pnt += 1
-#        try:
-#            data['timestamp'].append(str(datetime.now()))
-#            for entry in data:
-#                data[entry].append(caget(entry))
-#        try:
-#            sig = caget('BBQR:X:SB:RAW')
-#            cur = caget('TOPUPCC:rdCurCS')
-#        except:
-#            showerror(title='epics error', message='error reading epics')
-        if pressed:
-            roisig = [int(x.get()) for x in configs['roisig']]
-            roidamp = [int(x.get()) for x in configs['roidamp']]
-            
-            beg, end = roisig
-            sig = sig[beg:end]
-            N = end-beg          # number of points taken per measurement
-            
-            turns = arange(N)
-            t = turns*dt*1e3            # time in ms
+        sig, cur = getdata()
+        if not q['update_conf'].empty():
+            print('updating...')
+            q['update_conf'].get()
+            pars = inittswa()
         
-            # initialise pyfftw for both signals
-            myfftw, myifftw = init_pyfftw(N)
+        try:
+            plotdata, res_amp, res_tau, res_tswa  = tswa(sig, cur, pars, calib)
+        except Exception as e:
+            showerror(title='analysis error', message=e.message)
+            q['run'].put(False)
 
-        plotdata, res_amp, res_tau, res_tswa  = tswa(lines, sig, cur, t, turns,
-                                                     roidamp, fs, dt, calib,
-                                                     myfftw, myifftw, fd)
-        
         resultsdata = [res_amp, res_tau, res_tswa, pnt]
         if epics['write_amp'].get():
             caput(epics['amp'], res_amp[0])
@@ -216,7 +200,8 @@ def tswaloop(q, configs, epics):
         root.event_generate('<<update_plots>>', when='tail')
         q['update_results'].put(resultsdata)
         root.event_generate('<<update_results>>', when='tail')
-    print('goodbye!')
+    save('wisdom.npy', pyfftw.export_wisdom())
+    print('wisdom saved')
     return
 
 
@@ -227,7 +212,7 @@ def runthread(fun, argstuple):
     t_run.setDaemon(True)
     # start thread
     t_run.start()
-    return t_run
+    return
 
 
 def initfigs(labelframe):
@@ -268,12 +253,14 @@ if __name__ == '__main__':
     root.title('Tuneshift with ampltiude measurement')
     frame = Frame(root)
     frame.pack(fill=BOTH, expand=True)
+    lf_control = LabelFrame(frame, text="Control", padx=5, pady=5)
+    lf_control.grid(row=0, column=0, sticky=W+E+N+S, padx=10, pady=10)
     lf_settings = LabelFrame(frame, text="Settings", padx=5, pady=5)
-    lf_settings.grid(row=0, column=0, sticky=W+E+N+S, padx=10, pady=10)
+    lf_settings.grid(row=1, column=0, sticky=W+E+N+S, padx=10, pady=10)
     lf_results = LabelFrame(frame, text="Results", padx=5, pady=5)
-    lf_results.grid(row=1, column=0, sticky=W+E+N+S, padx=10, pady=10)
+    lf_results.grid(row=2, column=0, sticky=W+E+N+S, padx=10, pady=10)
     lf_plots = LabelFrame(frame, text="Matplotlib", padx=5, pady=5)
-    lf_plots.grid(row=0, column=2, rowspan=2, sticky=W+E+N+S, padx=10, pady=10)
+    lf_plots.grid(row=0, column=1, rowspan=3, sticky=W+E+N+S, padx=10, pady=10)
 
     rcdefaults()
     params = {'axes.labelsize': 10,
@@ -300,6 +287,25 @@ if __name__ == '__main__':
               'ytick.labelsize': 10}
     rcParams.update(params)
     fig, axes, lines = initfigs(lf_plots)
+    
+    def _start():
+        if not q['run'].empty():
+            q['run'].get()
+            # start actual program in thread
+            runthread(tswaloop, (q, configs, epics))
+        else:
+            showerror(title='user error', message='already running!')
+        return
+    cs_button(lf_control, 1, 1, 'Start', _start)
+    
+    def _stop():
+        q['run'].put(False)
+        return
+    cs_button(lf_control, 1, 2, 'Stop', _stop)
+    
+    def _update():
+        q['update_conf'].put(1)
+        return
 
     configs = {}
     configs['roisig'] = []
@@ -312,6 +318,7 @@ if __name__ == '__main__':
     configs['roidamp'].append(cs_Strentry(lf_settings, 3, 0, '23', entry_conf={'width' : '6'}))
     cs_label(lf_settings, 3, 1, '-')
     configs['roidamp'].append(cs_Strentry(lf_settings, 3, 2, '6000', entry_conf={'width' : '6'}))
+    cs_button(lf_settings, 9, 0, 'Update', _update)
 
     results, lab = {}, {}
     cs_label(lf_results, 0, 0, 'Initial amplitude', grid_conf={'sticky' : 'W'})
@@ -377,7 +384,8 @@ if __name__ == '__main__':
     # define threadsafe event handling functions that get required data from q
     q = {}
     q['run'] = Queue()
-    q['run'].put(True)
+    q['run'].put(False)
+    q['update_conf'] = Queue()
     q['update_plots'] = Queue()
     def update_plots(event):
         plotdata = q['update_plots'].get()
@@ -421,7 +429,4 @@ if __name__ == '__main__':
             root.destroy()
             root.quit()
     root.protocol("WM_DELETE_WINDOW", quitgui)
-
-    # start actual program in thread
-    t_run = runthread(tswaloop, (q, configs, epics))
     root.mainloop()
