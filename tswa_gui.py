@@ -15,7 +15,7 @@ except ImportError:
     import pickle
     pickle_opts = {'encoding': 'latin1'}
     from queue import Queue
-from epics import caget, caput
+from epics import caget, caput, PV
 from datetime import datetime
 from threading import Thread
 
@@ -27,7 +27,8 @@ from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
                                                NavigationToolbar2TkAgg)
 from numpy import (linspace, arange, concatenate, pi, complex128, zeros,
                    empty, angle, unwrap, diff, abs as npabs, ones, vstack, exp,
-                   log, linalg, cos, polyfit, poly1d, sqrt, diag, save, load)
+                   log, linalg, cos, polyfit, poly1d, sqrt, diag, save, load,
+                   sum as npsum)
 import pyfftw
 from layout import (cs_label, cs_Strentry, cs_checkbox, cp_label, cs_button)
 from hdf5 import h5load
@@ -112,6 +113,8 @@ def tswa(sig, cur, pars, calib, fitorder=1):
     initialamp = [popt[0], errs[0]]
     tau = [popt[1], errs[1]]
     fdamp = expfun(t2, *popt)
+    #chi2 = npsum((fdamp-amplitude_envelope)**2)
+    #chi2_dof = chi2/(len(amplitude_envelope) - 1 - len(popt))
     fdamp2 = fdamp**2
 
     # Instantaneous frequency
@@ -122,10 +125,12 @@ def tswa(sig, cur, pars, calib, fitorder=1):
     popt, pcov = polyfit(fdamp2, instfreq, fitorder, cov=True)
     errs = sqrt(diag(pcov))
     tswafit = poly1d(popt)(fdamp2)
+    tswa = [popt[0]*1e3, errs[0]*1e3]
 
     plotdata = [turns, bbfbcntsnorm, t2, amplitude_envelope, fdamp,
                 instantaneous_frequency, instfreq, fdamp2, tswafit]
-    return plotdata, initialamp, tau, [popt[0]*1e3, errs[0]*1e3]
+    resultsdata = [initialamp, tau, tswa]
+    return plotdata, resultsdata
 
 
 def inittswa():
@@ -147,17 +152,7 @@ def inittswa():
 
 
 data = h5load('guitswatestfile', False)
-def getdata():
-    try:
-        sig, cur = data['BBQR:X:SB:RAW'], data['TOPUPCC:rdCurCS']
-        #sig, cur = caget('BBQR:X:SB:RAW'), caget('TOPUPCC:rdCurCS')
-    except:
-        showerror(title='epics error', message='error reading epics')
-    return sig, cur
-
-
-
-def tswaloop(q, configs, epics):
+def tswaloop(q, configs, pv):
     # Turn on the cache for optimum pyfftw performance
     pyfftw.interfaces.cache.enable()
 
@@ -170,44 +165,61 @@ def tswaloop(q, configs, epics):
 
     with open('calib_InterpolatedUnivariateSpline.pkl', 'rb') as fh:
         calib = pickle.load(fh, **pickle_opts)
-
-    pars = inittswa()
-
-    pnt = 0
-
-    def cb():
-
-
-    # activate callback for BBQR:X:SB:RAW
-    while q['run'].empty():
-        pnt += 1
-        sig, cur = getdata()
+ 
+    def cb(**kwargs):
+        sig = kwargs['value']
+        cur = pv.curt.get()
+        global pars
         if not q['update_conf'].empty():
             print('updating...')
             q['update_conf'].get()
             pars = inittswa()
-
         try:
-            plotdata, res_amp, res_tau, res_tswa  = tswa(sig, cur, pars, calib)
+            plotdata, resultsdata  = tswa(sig, cur, pars, calib)
         except Exception as e:
             showerror(title='analysis error', message=e.message)
             q['run'].put(False)
-
-        resultsdata = [res_amp, res_tau, res_tswa, pnt]
-        if epics['write_amp'].get():
-            caput(epics['amp'], res_amp[0])
-        if epics['write_tau'].get():
-            caput(epics['tau'], res_tau[0])
-        if epics['write_tswa'].get():
-            caput(epics['tswa'], res_tswa[0])
-
+            
         q['update_plots'].put(plotdata)
         root.event_generate('<<update_plots>>', when='tail')
         q['update_results'].put(resultsdata)
         root.event_generate('<<update_results>>', when='tail')
+        
+        if not q['run'].empty():
+            cbvar.clear_callbacks()
+            save('wisdom.npy', pyfftw.export_wisdom())
+            print('wisdom saved')
+    
+    pars = 0
+    cbvar = PV('BBQR:X:SB:RAW', auto_monitor=True, callback=cb)
+        
 
-    save('wisdom.npy', pyfftw.export_wisdom())
-    print('wisdom saved')
+#    # activate callback for BBQR:X:SB:RAW
+#    while q['run'].empty():
+#        sig, cur = data['BBQR:X:SB:RAW'], data['TOPUPCC:rdCurCS']
+#        if not q['update_conf'].empty():
+#            print('updating...')
+#            q['update_conf'].get()
+#            pars = inittswa()
+#
+#        try:
+#            plotdata, res_amp, res_tau, res_tswa  = tswa(sig, cur, pars, calib)
+#        except Exception as e:
+#            showerror(title='analysis error', message=e.message)
+#            q['run'].put(False)
+#
+#        resultsdata = [res_amp, res_tau, res_tswa]
+#        if epics['write_amp'].get():
+#            caput(epics['amp'], res_amp[0])
+#        if epics['write_tau'].get():
+#            caput(epics['tau'], res_tau[0])
+#        if epics['write_tswa'].get():
+#            caput(epics['tswa'], res_tswa[0])
+#
+#        q['update_plots'].put(plotdata)
+#        root.event_generate('<<update_plots>>', when='tail')
+#        q['update_results'].put(resultsdata)
+#        root.event_generate('<<update_results>>', when='tail')
     return
 
 
@@ -301,7 +313,8 @@ if __name__ == '__main__':
         if not q['run'].empty():
             q['run'].get()
             # start actual program in thread
-            runthread(tswaloop, (q, configs, epics))
+            q['update_conf'].put(1)
+            runthread(tswaloop, (q, configs, pv))
         else:
             showerror(title='user error', message='already running!')
         return
@@ -327,7 +340,7 @@ if __name__ == '__main__':
     configs['roidamp'].append(cs_Strentry(lf_settings, 3, 0, '23', entry_conf={'width' : '6'}))
     cs_label(lf_settings, 3, 1, '-')
     configs['roidamp'].append(cs_Strentry(lf_settings, 3, 2, '6000', entry_conf={'width' : '6'}))
-    cs_button(lf_settings, 9, 0, 'Update', _update)
+    cs_button(lf_settings, 9, 0, 'Apply', _update)
 
     results, lab = {}, {}
     cs_label(lf_results, 0, 0, 'Initial amplitude', grid_conf={'sticky' : 'W'})
@@ -346,7 +359,7 @@ if __name__ == '__main__':
                                             grid_conf={'sticky' : 'W'})
 
     cs_label(lf_results, 6, 0, 'Measurement Nr.', grid_conf={'sticky' : 'W'})
-    results['pnt'] = cs_label(lf_results, 7, 0, 'nan',
+    results['pnt'] = cs_label(lf_results, 7, 0, '0',
                               grid_conf={'sticky' : 'W'})[0]
 
     epics = {}
@@ -357,6 +370,13 @@ if __name__ == '__main__':
     epics['tau'] = 'FKC01V'
     epics['write_tswa'] = cs_checkbox(lf_results, 5, 1, '', False)
     epics['tswa'] = 'FKC02V'
+    
+    class pv:
+        fill = PV('CUMZR:MBcurrent')
+        curt = PV('TOPUPCC:rdCurCS')
+        ampl = PV(epics['amp'])
+        tau = PV(epics['tau'])
+        tswa = PV(epics['tswa'])
 
     popup = Toplevel(bg='')
     popup.overrideredirect(True)
@@ -419,11 +439,23 @@ if __name__ == '__main__':
     q['update_results'] = Queue()
     def update_results(event):
         resultsdata = q['update_results'].get()
-        [res_amp, res_tau, res_tswa, pnt] = resultsdata
-        results['amp'].set(('{0:.2f} ' + u'\u00B1' + ' {1:.2f} mm').format(*res_amp))
-        results['tau'].set(('{0:.2f} ' + u'\u00B1' + ' {1:.2f} ms').format(*res_tau))
-        results['tswa'].set(('{0:.2f} ' + u'\u00B1' + ' {1:.2f} Hz/mm' + u'\u00B2').format(*res_tswa))
-        results['pnt'].set(pnt)
+        res_amp, res_tau, res_tswa = resultsdata
+        if res_tau[1]/res_tau[0] < 0.05:
+            if epics['write_amp'].get():
+                pv.ampl.put(res_amp[0])
+            if epics['write_tau'].get():
+                pv.tau.put(res_tau[0])
+            if epics['write_tswa'].get():
+                pv.tswa.put(res_tswa[0])
+            results['amp'].set(('{0:.2f} ' + u'\u00B1' + ' {1:.2f} mm').format(*res_amp))
+            results['tau'].set(('{0:.2f} ' + u'\u00B1' + ' {1:.2f} ms').format(*res_tau))
+            results['tswa'].set(('{0:.2f} ' + u'\u00B1' + ' {1:.2f} Hz/mm' + u'\u00B2').format(*res_tswa))
+            results['pnt'].set(int(results['pnt'].get()) + 1)
+        else:
+            results['amp'].set('error > 10%')
+            results['tau'].set('error > 10%')
+            results['tswa'].set('error > 10%')
+            results['pnt'].set(int(results['pnt'].get()) + 1)
         return
     root.bind('<<update_results>>', update_results)
 
