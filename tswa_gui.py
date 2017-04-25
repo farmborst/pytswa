@@ -69,10 +69,10 @@ def drawpatch(ax, leftx, width):
 
 def tswa(sig, cur, pars, calib, fitorder=1):
     N, t, turns, roisig, roidamp, fs, dt, myfftw, myifftw, fd = pars
-    
+
     beg, end = roisig
     sig = sig[beg:end]
-    
+
     bbfbcntsnorm = (sig.T/cur).T
     bbfbpos = calib(bbfbcntsnorm)
 
@@ -149,31 +149,36 @@ def inittswa():
 data = h5load('guitswatestfile', False)
 def getdata():
     try:
-        #sig, cur = data['BBQR:X:SB:RAW'], data['TOPUPCC:rdCurCS']
-        sig, cur = caget('BBQR:X:SB:RAW'), caget('TOPUPCC:rdCurCS')
+        sig, cur = data['BBQR:X:SB:RAW'], data['TOPUPCC:rdCurCS']
+        #sig, cur = caget('BBQR:X:SB:RAW'), caget('TOPUPCC:rdCurCS')
     except:
         showerror(title='epics error', message='error reading epics')
     return sig, cur
-    
+
 
 
 def tswaloop(q, configs, epics):
     # Turn on the cache for optimum pyfftw performance
     pyfftw.interfaces.cache.enable()
-    
+
     # Import Wisdom Files for pyFFTW
     try:
         pyfftw.import_wisdom(load('wisdom.npy'))
         print('wisdom loaded from file')
     except:
         pass
-    
+
     with open('calib_InterpolatedUnivariateSpline.pkl', 'rb') as fh:
         calib = pickle.load(fh, **pickle_opts)
-    
+
     pars = inittswa()
-    
+
     pnt = 0
+
+    def cb():
+
+
+    # activate callback for BBQR:X:SB:RAW
     while q['run'].empty():
         pnt += 1
         sig, cur = getdata()
@@ -181,7 +186,7 @@ def tswaloop(q, configs, epics):
             print('updating...')
             q['update_conf'].get()
             pars = inittswa()
-        
+
         try:
             plotdata, res_amp, res_tau, res_tswa  = tswa(sig, cur, pars, calib)
         except Exception as e:
@@ -200,6 +205,7 @@ def tswaloop(q, configs, epics):
         root.event_generate('<<update_plots>>', when='tail')
         q['update_results'].put(resultsdata)
         root.event_generate('<<update_results>>', when='tail')
+
     save('wisdom.npy', pyfftw.export_wisdom())
     print('wisdom saved')
     return
@@ -287,7 +293,10 @@ if __name__ == '__main__':
               'ytick.labelsize': 10}
     rcParams.update(params)
     fig, axes, lines = initfigs(lf_plots)
-    
+
+    q = {}
+    q['run'] = Queue()
+    q['run'].put(False)
     def _start():
         if not q['run'].empty():
             q['run'].get()
@@ -297,12 +306,12 @@ if __name__ == '__main__':
             showerror(title='user error', message='already running!')
         return
     cs_button(lf_control, 1, 1, 'Start', _start)
-    
+
     def _stop():
         q['run'].put(False)
         return
     cs_button(lf_control, 1, 2, 'Stop', _stop)
-    
+
     def _update():
         q['update_conf'].put(1)
         return
@@ -352,11 +361,11 @@ if __name__ == '__main__':
     popup = Toplevel(bg='')
     popup.overrideredirect(True)
     popup.withdraw()
-    popupstr, popuplab = cp_label(popup, '', 
+    popupstr, popuplab = cp_label(popup, '',
                                   label_conf={'bg':'black', 'fg':'green',
                                               'font':'Mono 15'},
                                   pack_conf={'side':'right'})
-    
+
     def b2click(event, text):
         # get epics var name
         text = epics[text]
@@ -368,12 +377,12 @@ if __name__ == '__main__':
         x, y = root.winfo_pointerx(), root.winfo_pointery()
         popup.wm_geometry('{:d}x{:d}+{:d}+{:d}'.format(w, h, x, y))
         popup.deiconify()
-        
+
         # copy epics variable to xsel
         # universal_newlines -> input and output as text (not byte) strings
         p = Popen(['xsel', '-pi'], stdin=PIPE, universal_newlines=True)
         p.communicate(input=text)
-        
+
         # copy epics name to clipboard
         root.clipboard_clear()
         root.clipboard_append(text)
@@ -382,9 +391,6 @@ if __name__ == '__main__':
     [lab[l].bind("<ButtonRelease-2>", lambda event: popup.withdraw()) for l in lab]
 
     # define threadsafe event handling functions that get required data from q
-    q = {}
-    q['run'] = Queue()
-    q['run'].put(False)
     q['update_conf'] = Queue()
     q['update_plots'] = Queue()
     def update_plots(event):
@@ -409,7 +415,7 @@ if __name__ == '__main__':
         fig.canvas.draw()
         return
     root.bind('<<update_plots>>', update_plots)
-    
+
     q['update_results'] = Queue()
     def update_results(event):
         resultsdata = q['update_results'].get()
